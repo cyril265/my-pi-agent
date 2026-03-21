@@ -5,22 +5,14 @@
 !.gitignore
 !agent/
 
-# Ignore all Pi skills
-agent/skills/
-skills/
-
 # Only keep the shareable part of agent/
 agent/*
 !agent/AGENTS.md
 !agent/settings.json
-!agent/prompts/
-!agent/prompts/**
-!agent/themes/
-!agent/themes/**
-!agent/extensions/
-!agent/extensions/**
-!agent/multi-pass.json
-!agent/pi-sub-bar-settings.json
+
+# Ignore all Pi skills
+agent/skills/
+skills/
 
 # Cache, temp, logs, sessions
 agent/cache/
