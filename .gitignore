@@ -1,0 +1,61 @@
+# Ignore everything at the ~/.pi root by default
+*
+
+# Keep repo metadata
+!.gitignore
+!agent/
+
+# Ignore all Pi skills
+agent/skills/
+skills/
+
+# Only keep the shareable part of agent/
+agent/*
+!agent/AGENTS.md
+!agent/prompts/
+!agent/themes/
+!agent/extensions/
+!agent/modes.json
+!agent/multi-pass.json
+!agent/pi-sub-bar-settings.json
+
+# Cache, temp, logs, sessions
+agent/cache/
+agent/tmp/
+agent/sessions/
+agent/history/
+cache/
+logs/
+*.log
+.tmp/
+agent/mcp-cache.json
+agent/pi-debug.log
+agent/.update-check
+
+# Secrets and machine-local config
+.env
+.env.*
+!.env.example
+*.local
+agent/auth.json
+agent/settings.json
+agent/settings.local.json
+agent/models.json
+agent/mcp.json
+pi-acp/session-map.json
+web-search.json
+
+# Local tools and dependency output
+node_modules/
+colima-back/
+pi-acp/
+extensions/
+agent/bin/
+agent/git/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
