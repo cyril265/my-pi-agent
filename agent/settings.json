@@ -1,0 +1,24 @@
+{
+  "lastChangelogVersion": "0.61.1",
+  "defaultProvider": "openai-codex-2",
+  "defaultModel": "gpt-5.4",
+  "defaultThinkingLevel": "medium",
+  "packages": [
+    "npm:@mariozechner/pi-ai",
+    "npm:pi-ghostty",
+    "https://github.com/ogulcancelik/pi-ghostty-theme-sync",
+    "npm:pi-mcp-adapter",
+    "git:github.com/ferologics/pi-notify",
+    "npm:oh-pi",
+    "https://github.com/ivanrvpereira/pi-perplexity@11c543c0de5567671db5ba04b38f3e2f8161ea18",
+    "../../ai-stuff/pi-web-access",
+    "npm:@plannotator/pi-extension@0.12.0",
+    "npm:@marckrenn/pi-sub-bar@1.4.0",
+    "npm:pi-bash-trim@1.0.2",
+    "npm:pi-multi-pass"
+  ],
+  "theme": "ghostty-sync-06917059",
+  "followUpMode": "one-at-a-time",
+  "hideThinkingBlock": false,
+  "transport": "sse"
+}

@@ -12,10 +12,13 @@ skills/
 # Only keep the shareable part of agent/
 agent/*
 !agent/AGENTS.md
+!agent/settings.json
 !agent/prompts/
+!agent/prompts/**
 !agent/themes/
+!agent/themes/**
 !agent/extensions/
-!agent/modes.json
+!agent/extensions/**
 !agent/multi-pass.json
 !agent/pi-sub-bar-settings.json
 
@@ -38,7 +41,6 @@ agent/.update-check
 !.env.example
 *.local
 agent/auth.json
-agent/settings.json
 agent/settings.local.json
 agent/models.json
 agent/mcp.json
