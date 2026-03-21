@@ -43,8 +43,8 @@ Priorities:
 - DON'T search for library code/nuget packages in the file system, no weird nuget commands, no text search for library code
 - DON'T check non nullable values for null
 - DON'T use Async suffix for methods
-- DON'T DO THIS: ArgumentNullException.ThrowIfNull(chunk);
-- DON'T DO THIS: TryX methods with out parameters. Prefer: return nullable reference types instead
+- DON'T use ArgumentNullException.ThrowIfNull(chunk);
+- DON'T use TryX methods with 'out' parameters. Prefer: return nullable reference types instead
 - DON'T inspect the obj/build/node_modules output directories for libraries etc
 
 # general
