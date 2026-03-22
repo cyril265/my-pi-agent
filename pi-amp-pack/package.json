@@ -1,0 +1,19 @@
+{
+  "name": "pi-amp-pack",
+  "version": "0.1.0",
+  "private": true,
+  "keywords": ["pi-package"],
+  "dependencies": {
+    "sq-node": "file:./sq-node"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  }
+}

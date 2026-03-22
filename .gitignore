@@ -4,6 +4,8 @@
 # Keep repo metadata
 !.gitignore
 !agent/
+!pi-amp-pack/
+!pi-amp-pack/**
 
 # Only keep the shareable part of agent/
 agent/*
@@ -44,6 +46,8 @@ node_modules/
 colima-back/
 pi-acp/
 extensions/
+!pi-amp-pack/extensions/
+!pi-amp-pack/extensions/**
 agent/bin/
 agent/git/
 
