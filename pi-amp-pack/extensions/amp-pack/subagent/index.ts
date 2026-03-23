@@ -265,9 +265,9 @@ class RunProgressTracker {
 		if (this.mode === "parallel") {
 			parts.push(`Plan: ${total} parallel task${total === 1 ? "" : "s"}`);
 			parts.push(`Done: ${done}/${total}`);
-			if (running.length > 0) parts.push(`Running: ${running.slice(0, 3).map((item) => item.agent).join(", ")}`);
-			if (queued.length > 0) parts.push(`Queued: ${queued.slice(0, 3).map((item) => item.agent).join(", ")}`);
-			if (failed.length > 0) parts.push(`Failed: ${failed.slice(0, 2).map((item) => item.agent).join(", ")}`);
+			if (running.length > 0) parts.push(`Running: ${summarizeAgents(running)}`);
+			if (queued.length > 0) parts.push(`Queued: ${summarizeAgents(queued)}`);
+			if (failed.length > 0) parts.push(`Failed: ${summarizeAgents(failed, 2)}`);
 			return parts.join("\n");
 		}
 
@@ -278,6 +278,25 @@ class RunProgressTracker {
 		if (failed.length > 0) parts.push("Status: failed");
 		return parts.join("\n");
 	}
+}
+
+function summarizeAgents(items: ProgressItem[], maxEntries = 3): string {
+	const counts = new Map<string, number>();
+	const order: string[] = [];
+
+	for (const item of items) {
+		const current = counts.get(item.agent);
+		if (current === undefined) order.push(item.agent);
+		counts.set(item.agent, (current ?? 0) + 1);
+	}
+
+	const visible = order.slice(0, maxEntries).map((agent) => {
+		const count = counts.get(agent) ?? 0;
+		return count > 1 ? `${agent} ×${count}` : agent;
+	});
+	const hidden = order.length - visible.length;
+	if (hidden > 0) visible.push(`+${hidden} more`);
+	return visible.join(", ");
 }
 
 function summarizeTaskLabel(agent: string, task: string): string {

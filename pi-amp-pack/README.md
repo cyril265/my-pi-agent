@@ -21,6 +21,19 @@ Then run:
 /reload
 ```
 
+## Agents
+
+This package ships a small set of bundled agents that are synced into `~/.pi/agent/agents`.
+
+- `coder` — fast worker for clearly scoped local code changes, fixes, refactors, and tests
+- `search` — quick codebase search agent for finding relevant files and line ranges
+- `librarian` — deep codebase understanding agent for architecture, flow tracing, and subsystem relationships
+- `oracle` — stronger second-opinion agent for planning, reviews, difficult bugs, and technical trade-offs
+- `reviewer` — diff-focused code review agent for file-by-file change analysis
+- `code-tour` — guided walkthrough agent for explaining a diff in a useful reading order
+
+The bundled routing guidance also pushes usage toward the smallest sufficient workflow: work directly for small local tasks, use `search` for discovery, and delegate to specialist agents only when it materially helps.
+
 ## Subagent API
 
 Preferred shape:
