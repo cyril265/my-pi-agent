@@ -21,6 +21,41 @@ Then run:
 /reload
 ```
 
+## Subagent API
+
+Preferred shape:
+
+```ts
+{
+  mode?: "single" | "parallel" | "chain",
+  items: [
+    {
+      agent: "coder" | {
+        type?: "generic",
+        name?: string,
+        systemPrompt: string,
+        tools?: string[],
+        model?: string,
+        thinking?: "low" | "medium" | "high" | "xhigh" | "inherit"
+      },
+      task: string,
+      thinking?: "low" | "medium" | "high" | "xhigh" | "inherit",
+      cwd?: string
+    }
+  ],
+  thinking?: "low" | "medium" | "high" | "xhigh" | "inherit",
+  todo?: { enabled?: boolean, queuePath?: string, runTitle?: string },
+  cwd?: string
+}
+```
+
+Notes:
+- `mode` defaults to `single` for one item and `parallel` for multiple items
+- `single` mode requires exactly one item
+- `parallel` and `chain` mode require at least two items
+- `chain` mode runs sequentially and replaces `{previous}` in later tasks
+- `agent` can be a saved agent name or an inline generic agent configured entirely by the caller
+
 ## Subagent Todo Tracking
 
 Todo tracking is enabled by default on the `subagent` tool.

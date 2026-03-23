@@ -4,11 +4,12 @@
  * Spawns a separate `pi` process for each subagent invocation,
  * giving it an isolated context window.
  *
- * Supports three modes:
- *   - Single: { agent: "name", task: "..." }
- *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
- *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
+ * Preferred API:
+ *   - { items: [{ agent, task }] } -> single mode
+ *   - { items: [{ agent, task }, ...] } -> parallel mode
+ *   - { mode: "chain", items: [{ agent, task: "... {previous} ..." }, ...] }
  *
+ * `agent` can be a saved agent name or an inline generic agent object.
  * Uses JSON mode to capture structured output from subagents.
  */
 
@@ -173,7 +174,7 @@ interface UsageStats {
 
 interface SingleResult {
 	agent: string;
-	agentSource: "user" | "project" | "unknown";
+	agentSource: AgentSource;
 	task: string;
 	exitCode: number;
 	messages: Message[];
@@ -419,10 +420,98 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+type AgentSource = "user" | "project" | "inline" | "unknown";
+
+interface GenericAgentSpec {
+	type?: "generic";
+	name?: string;
+	description?: string;
+	tools?: string[];
+	model?: string;
+	thinking?: AgentThinkingLevel;
+	systemPrompt: string;
+}
+
+type RequestedAgent = string | GenericAgentSpec;
+
+interface NormalizedTaskItem {
+	agent: RequestedAgent;
+	task: string;
+	thinking?: AgentThinkingLevel;
+	cwd?: string;
+}
+
+interface NormalizedSubagentRequest {
+	mode: "single" | "parallel" | "chain";
+	items: NormalizedTaskItem[];
+	todo?: TodoTrackingOptions;
+}
+
+interface ResolvedAgentConfig {
+	name: string;
+	source: AgentSource;
+	tools?: string[];
+	model?: string;
+	thinking?: AgentThinkingLevel;
+	systemPrompt: string;
+}
+
+function isGenericAgentSpec(value: RequestedAgent): value is GenericAgentSpec {
+	return typeof value !== "string";
+}
+
+function getAgentDisplayName(agent: RequestedAgent): string {
+	if (typeof agent === "string") return agent;
+	return agent.name?.trim() || "generic";
+}
+
+function buildResolvedAgent(
+	agents: AgentConfig[],
+	requestedAgent: RequestedAgent,
+): { config?: ResolvedAgentConfig; unknownAgentName?: string } {
+	if (isGenericAgentSpec(requestedAgent)) {
+		return {
+			config: {
+				name: getAgentDisplayName(requestedAgent),
+				source: "inline",
+				tools: requestedAgent.tools,
+				model: requestedAgent.model,
+				thinking: requestedAgent.thinking,
+				systemPrompt: requestedAgent.systemPrompt,
+			},
+		};
+	}
+
+	const agent = agents.find((a) => a.name === requestedAgent);
+	if (!agent) {
+		return { unknownAgentName: requestedAgent };
+	}
+
+	return {
+		config: {
+			name: agent.name,
+			source: agent.source,
+			tools: agent.tools,
+			model: agent.model,
+			thinking: agent.thinking,
+			systemPrompt: agent.systemPrompt,
+		},
+	};
+}
+
+function getRequestedAgentHeaderMeta(agents: AgentConfig[], requestedAgent: RequestedAgent): { name: string; model?: string; thinking?: AgentThinkingLevel } {
+	const resolved = buildResolvedAgent(agents, requestedAgent);
+	return {
+		name: resolved.config?.name ?? getAgentDisplayName(requestedAgent),
+		model: resolved.config?.model,
+		thinking: resolved.config?.thinking,
+	};
+}
+
 async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
-	agentName: string,
+	requestedAgent: RequestedAgent,
 	task: string,
 	thinkingOverride: AgentThinkingLevel | undefined,
 	callerThinking: string | undefined,
@@ -432,22 +521,24 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
-	const agent = agents.find((a) => a.name === agentName);
+	const resolved = buildResolvedAgent(agents, requestedAgent);
+	const displayName = getAgentDisplayName(requestedAgent);
 
-	if (!agent) {
+	if (!resolved.config) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
 		return {
-			agent: agentName,
+			agent: resolved.unknownAgentName ?? displayName,
 			agentSource: "unknown",
 			task,
 			exitCode: 1,
 			messages: [],
-			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
+			stderr: `Unknown agent: "${resolved.unknownAgentName ?? displayName}". Available agents: ${available}.`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 			step,
 		};
 	}
 
+	const agent = resolved.config;
 	const effectiveThinking = resolveThinkingLevel(thinkingOverride, agent.thinking, callerThinking);
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (agent.model) args.push("--model", agent.model);
@@ -458,7 +549,7 @@ async function runSingleAgent(
 	let tmpPromptPath: string | null = null;
 
 	const currentResult: SingleResult = {
-		agent: agentName,
+		agent: agent.name,
 		agentSource: agent.source,
 		task,
 		exitCode: 0,
@@ -590,53 +681,94 @@ async function runSingleAgent(
 	}
 }
 
-const TaskItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task to delegate to the agent" }),
-	thinking: Type.Optional(ThinkingLevelSchema),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-});
+const GenericAgentSchema = Type.Object(
+	{
+		type: Type.Optional(Type.Literal("generic")),
+		name: Type.Optional(Type.String({ description: "Optional display name for an inline generic agent" })),
+		description: Type.Optional(Type.String({ description: "Optional description for the inline generic agent" })),
+		tools: Type.Optional(Type.Array(Type.String(), { description: "Optional tool allowlist for the inline generic agent" })),
+		model: Type.Optional(Type.String({ description: "Optional model override for the inline generic agent" })),
+		thinking: Type.Optional(ThinkingLevelSchema),
+		systemPrompt: Type.String({ description: "System prompt to use for the inline generic agent" }),
+	},
+	{ additionalProperties: false },
+);
 
-const ChainItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
-	thinking: Type.Optional(ThinkingLevelSchema),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-});
+const AgentTargetSchema = Type.Union([
+	Type.String({ description: "Name of the saved agent to invoke" }),
+	GenericAgentSchema,
+]);
 
-const SubagentParams = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
-	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	thinking: Type.Optional(ThinkingLevelSchema),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task, thinking?} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task, thinking?} for sequential execution" })),
-	todo: Type.Optional(
-		Type.Object(
-			{
-				enabled: Type.Optional(
-					Type.Boolean({ description: "Enable or disable sq todo tracking for this subagent run. Default: true." }),
-				),
-				queuePath: Type.Optional(Type.String({ description: "Optional sq queue path override (issues.jsonl)." })),
-				runTitle: Type.Optional(Type.String({ description: "Optional sq run title for the parent tracking item." })),
-			},
-			{ additionalProperties: false },
-		),
-	),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
-});
-
-interface AgentInvocation {
-	requestedName: string;
-	taskCwd: string;
-	discovery: AgentDiscoveryResult;
-	agent: AgentConfig | undefined;
+function createDelegatedTaskSchema(taskDescription: string) {
+	return Type.Object({
+		agent: AgentTargetSchema,
+		task: Type.String({ description: taskDescription }),
+		thinking: Type.Optional(ThinkingLevelSchema),
+		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	});
 }
 
-function resolveAgentInvocation(defaultCwd: string, requestedName: string, requestedCwd: string | undefined): AgentInvocation {
-	const taskCwd = requestedCwd ?? defaultCwd;
-	const discovery = discoverAgents(taskCwd, "user");
-	const agent = discovery.agents.find((a) => a.name === requestedName);
-	return { requestedName, taskCwd, discovery, agent };
+const TaskItem = createDelegatedTaskSchema("Task to delegate to the agent. In chain mode, supports {previous} placeholder for prior output.");
+
+const TodoOptionsSchema = Type.Object(
+	{
+		enabled: Type.Optional(
+			Type.Boolean({ description: "Enable or disable sq todo tracking for this subagent run. Default: true." }),
+		),
+		queuePath: Type.Optional(Type.String({ description: "Optional sq queue path override (issues.jsonl)." })),
+		runTitle: Type.Optional(Type.String({ description: "Optional sq run title for the parent tracking item." })),
+	},
+	{ additionalProperties: false },
+);
+
+const ExecutionModeSchema = StringEnum(["single", "parallel", "chain"] as const, {
+	description: "Execution mode. Defaults to single for one item and parallel for multiple items.",
+});
+
+const SubagentParams = Type.Object(
+	{
+		mode: Type.Optional(ExecutionModeSchema),
+		items: Type.Array(TaskItem, { minItems: 1, description: "List of delegated agent runs." }),
+		thinking: Type.Optional(ThinkingLevelSchema),
+		todo: Type.Optional(TodoOptionsSchema),
+		cwd: Type.Optional(Type.String({ description: "Default working directory for delegated agent processes" })),
+	},
+	{ additionalProperties: false },
+);
+
+function normalizeSubagentRequest(params: { mode?: "single" | "parallel" | "chain"; items: NormalizedTaskItem[]; todo?: TodoTrackingOptions; cwd?: string }): { request?: NormalizedSubagentRequest; error?: string } {
+	const items = params.items;
+	if (!Array.isArray(items) || items.length === 0) {
+		return { error: "No items provided. Add at least one entry to `items`." };
+	}
+
+	const mode = params.mode ?? (items.length === 1 ? "single" : "parallel");
+	if (mode === "single" && items.length !== 1) {
+		return { error: "Single mode requires exactly one item." };
+	}
+	if (mode !== "single" && items.length < 2) {
+		return { error: `${mode[0].toUpperCase()}${mode.slice(1)} mode requires at least two items.` };
+	}
+
+	return {
+		request: {
+			mode,
+			items: items.map((item) => ({ ...item, cwd: item.cwd ?? params.cwd })),
+			todo: params.todo,
+		},
+	};
+}
+
+function resolveAvailableAgents(cwd: string, items: NormalizedTaskItem[]): AgentDiscoveryResult {
+	const discoveries = new Map<string, AgentConfig>();
+	let projectAgentsDir: string | null = null;
+	for (const item of items) {
+		const taskCwd = item.cwd ?? cwd;
+		const discovery = discoverAgents(taskCwd, "user");
+		projectAgentsDir ??= discovery.projectAgentsDir;
+		for (const agent of discovery.agents) discoveries.set(agent.name, agent);
+	}
+	return { agents: Array.from(discoveries.values()), projectAgentsDir };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -660,24 +792,17 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			"Supports per-agent default thinking and structured overrides via thinking.",
+			"API: { mode?, items:[{ agent, task, thinking?, cwd? }] } with mode defaulting to single for one item and parallel for multiple items.",
+			"Chain mode runs sequentially and supports {previous} placeholders.",
+			"agent can be a saved agent name or an inline generic agent object with systemPrompt, tools, model, and thinking.",
 			'Use thinking: "inherit" to use the caller\'s current thinking level.',
-			"Uses user agents from ~/.pi/agent/agents.",
 			"Todo tracking is enabled by default; set todo.enabled:false to disable tracking for a call.",
 		].join(" "),
 		parameters: SubagentParams,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const baseDiscovery = discoverAgents(ctx.cwd, "user");
 			const callerThinking = pi.getThinkingLevel();
-
-			const hasChain = (params.chain?.length ?? 0) > 0;
-			const hasTasks = (params.tasks?.length ?? 0) > 0;
-			const hasSingle = Boolean(params.agent && params.task);
-			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
-
-			const mode: "single" | "parallel" | "chain" = hasChain ? "chain" : hasTasks ? "parallel" : "single";
+			const normalized = normalizeSubagentRequest(params);
 			const makeDetails =
 				(detailsMode: "single" | "parallel" | "chain") =>
 				(results: SingleResult[]): SubagentDetails => ({
@@ -685,22 +810,28 @@ export default function (pi: ExtensionAPI) {
 					results,
 				});
 
-			if (modeCount !== 1) {
+			if (!normalized.request) {
+				const baseDiscovery = discoverAgents(ctx.cwd, "user");
 				const available = baseDiscovery.agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
-					content: [{ type: "text", text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}` }],
+					content: [{ type: "text", text: `${normalized.error ?? "Invalid parameters."}\nAvailable agents: ${available}` }],
 					details: makeDetails("single")([]),
 				};
 			}
 
-			const plannedTasks = params.chain?.map((step, index) => ({ key: `chain:${index}`, agent: step.agent, task: step.task, step: index + 1 }))
-				?? params.tasks?.map((task, index) => ({ key: `parallel:${index}`, agent: task.agent, task: task.task }))
-				?? (params.agent && params.task ? [{ key: "single:0", agent: params.agent, task: params.task }] : []);
-			const progressTracker = new RunProgressTracker(mode, plannedTasks);
+			const request = normalized.request;
+			const availableAgents = resolveAvailableAgents(ctx.cwd, request.items);
+			const plannedTasks = request.items.map((item, index) => ({
+				key: `${request.mode === "chain" ? "chain" : request.mode === "parallel" ? "parallel" : "single"}:${index}`,
+				agent: getAgentDisplayName(item.agent),
+				task: item.task,
+				step: request.mode === "chain" ? index + 1 : undefined,
+			}));
+			const progressTracker = new RunProgressTracker(request.mode, plannedTasks);
 			const emitProgressUpdate = (partial: AgentToolResult<SubagentDetails>) => onUpdate?.(attachProgressSummary(partial, progressTracker));
-			emitProgressUpdate({ content: [{ type: "text", text: "(starting...)" }], details: makeDetails(mode)([]) });
+			emitProgressUpdate({ content: [{ type: "text", text: "(starting...)" }], details: makeDetails(request.mode)([]) });
 
-			const todoTracker = await SqTodoTracker.create(ctx.cwd, mode, toolCallId, params.todo ?? {});
+			const todoTracker = await SqTodoTracker.create(ctx.cwd, request.mode, toolCallId, request.todo ?? {});
 			const finalizeAndReturn = async (result: AgentToolResult<SubagentDetails>) => {
 				const withProgress = attachProgressSummary(result, progressTracker);
 				await todoTracker?.finalize(!result.isError, getResultSummaryText(withProgress));
@@ -708,27 +839,21 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			try {
-				if (params.chain && params.chain.length > 0) {
+				if (request.mode === "chain") {
 					const results: SingleResult[] = [];
 					let previousOutput = "";
 
-					for (let i = 0; i < params.chain.length; i++) {
-						const step = params.chain[i];
+					for (let i = 0; i < request.items.length; i++) {
+						const step = request.items[i];
 						const taskKey = `chain:${i}`;
 						const previousTaskId = i > 0 ? todoTracker?.getTaskId(`chain:${i - 1}`) : undefined;
-						const invocation = resolveAgentInvocation(ctx.cwd, step.agent, step.cwd);
+						const taskCwd = step.cwd ?? ctx.cwd;
 						const boundedPrevious = buildChainContext(previousOutput);
 						const taskWithContext = step.task.replace(/\{previous\}/g, boundedPrevious);
+						const agentName = getAgentDisplayName(step.agent);
 
-						await todoTracker?.startTask(
-							taskKey,
-							step.agent,
-							taskWithContext,
-							invocation.taskCwd,
-							i + 1,
-							previousTaskId ? [previousTaskId] : [],
-						);
-						progressTracker.startTask(taskKey, step.agent, taskWithContext, i + 1);
+						await todoTracker?.startTask(taskKey, agentName, taskWithContext, taskCwd, i + 1, previousTaskId ? [previousTaskId] : []);
+						progressTracker.startTask(taskKey, agentName, taskWithContext, i + 1);
 						emitProgressUpdate({ content: [{ type: "text", text: "(running...)" }], details: makeDetails("chain")(results) });
 
 						const chainUpdate: OnUpdateCallback | undefined = onUpdate
@@ -747,12 +872,12 @@ export default function (pi: ExtensionAPI) {
 						try {
 							const result = await runSingleAgent(
 								ctx.cwd,
-								invocation.discovery.agents,
+								availableAgents.agents,
 								step.agent,
 								taskWithContext,
 								step.thinking ?? params.thinking,
 								callerThinking,
-								invocation.taskCwd,
+								taskCwd,
 								i + 1,
 								signal,
 								chainUpdate,
@@ -768,7 +893,7 @@ export default function (pi: ExtensionAPI) {
 							if (isError) {
 								const errorMsg = getResultErrorText(result);
 								return await finalizeAndReturn({
-									content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+									content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${agentName}): ${errorMsg}` }],
 									details: makeDetails("chain")(results),
 									isError: true,
 								});
@@ -789,28 +914,28 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				if (params.tasks && params.tasks.length > 0) {
-					if (params.tasks.length > MAX_PARALLEL_TASKS) {
+				if (request.mode === "parallel") {
+					if (request.items.length > MAX_PARALLEL_TASKS) {
 						return await finalizeAndReturn({
 							content: [
-								{ type: "text", text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` },
+								{ type: "text", text: `Too many parallel tasks (${request.items.length}). Max is ${MAX_PARALLEL_TASKS}.` },
 							],
 							details: makeDetails("parallel")([]),
 							isError: true,
 						});
 					}
 
-					const allResults: SingleResult[] = new Array(params.tasks.length);
-					for (let i = 0; i < params.tasks.length; i++) {
+					const allResults: SingleResult[] = new Array(request.items.length);
+					for (let i = 0; i < request.items.length; i++) {
 						allResults[i] = {
-							agent: params.tasks[i].agent,
+							agent: getAgentDisplayName(request.items[i].agent),
 							agentSource: "unknown",
-							task: params.tasks[i].task,
+							task: request.items[i].task,
 							exitCode: -1,
 							messages: [],
 							stderr: "",
 							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-							thinkingLevel: resolveThinkingLevel(params.tasks[i].thinking ?? params.thinking, undefined, callerThinking),
+							thinkingLevel: resolveThinkingLevel(request.items[i].thinking ?? params.thinking, isGenericAgentSpec(request.items[i].agent) ? request.items[i].agent.thinking : undefined, callerThinking),
 						};
 					}
 
@@ -821,21 +946,22 @@ export default function (pi: ExtensionAPI) {
 						});
 					};
 
-					const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+					const results = await mapWithConcurrencyLimit(request.items, MAX_CONCURRENCY, async (t, index) => {
 						const taskKey = `parallel:${index}`;
-						const invocation = resolveAgentInvocation(ctx.cwd, t.agent, t.cwd);
-						await todoTracker?.startTask(taskKey, t.agent, t.task, invocation.taskCwd, undefined, []);
-						progressTracker.startTask(taskKey, t.agent, t.task);
+						const taskCwd = t.cwd ?? ctx.cwd;
+						const agentName = getAgentDisplayName(t.agent);
+						await todoTracker?.startTask(taskKey, agentName, t.task, taskCwd, undefined, []);
+						progressTracker.startTask(taskKey, agentName, t.task);
 						emitParallelUpdate();
 						try {
 							const result = await runSingleAgent(
 								ctx.cwd,
-								invocation.discovery.agents,
+								availableAgents.agents,
 								t.agent,
 								t.task,
 								t.thinking ?? params.thinking,
 								callerThinking,
-								invocation.taskCwd,
+								taskCwd,
 								undefined,
 								signal,
 								(partial) => {
@@ -883,21 +1009,23 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				if (params.agent && params.task) {
-					const invocation = resolveAgentInvocation(ctx.cwd, params.agent, params.cwd);
+				if (request.mode === "single") {
+					const singleItem = request.items[0];
 					const taskKey = "single:0";
-					await todoTracker?.startTask(taskKey, params.agent, params.task, invocation.taskCwd, undefined, []);
-					progressTracker.startTask(taskKey, params.agent, params.task);
+					const taskCwd = singleItem.cwd ?? ctx.cwd;
+					const agentName = getAgentDisplayName(singleItem.agent);
+					await todoTracker?.startTask(taskKey, agentName, singleItem.task, taskCwd, undefined, []);
+					progressTracker.startTask(taskKey, agentName, singleItem.task);
 					emitProgressUpdate({ content: [{ type: "text", text: "(running...)" }], details: makeDetails("single")([]) });
 					try {
 						const result = await runSingleAgent(
 							ctx.cwd,
-							invocation.discovery.agents,
-							params.agent,
-							params.task,
-							params.thinking,
+							availableAgents.agents,
+							singleItem.agent,
+							singleItem.task,
+							singleItem.thinking ?? params.thinking,
 							callerThinking,
-							invocation.taskCwd,
+							taskCwd,
 							undefined,
 							signal,
 							emitProgressUpdate,
@@ -929,9 +1057,8 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
-				const available = baseDiscovery.agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return await finalizeAndReturn({
-					content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
+					content: [{ type: "text", text: "Invalid parameters." }],
 					details: makeDetails("single")([]),
 					isError: true,
 				});
@@ -939,53 +1066,61 @@ export default function (pi: ExtensionAPI) {
 				const errorMessage = error instanceof Error ? error.message : String(error);
 				return await finalizeAndReturn({
 					content: [{ type: "text", text: `Subagent execution failed: ${errorMessage}` }],
-					details: makeDetails(mode)([]),
+					details: makeDetails(request.mode)([]),
 					isError: true,
 				});
 			}
 		},
 
 		renderCall(args, theme) {
-			const thinkingText = (thinking?: AgentThinkingLevel) => (thinking ? theme.fg("warning", ` thinking:${thinking}`) : "");
-			if (args.chain && args.chain.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					thinkingText(args.thinking);
-				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-					const step = args.chain[i];
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = wrapTaskPreview(cleanTask);
-					text +=
-						"\n  " +
-						theme.fg("muted", `${i + 1}.`) +
-						" " +
-						theme.fg("accent", step.agent) +
-						thinkingText(step.thinking) +
-						theme.fg("dim", ` ${preview}`);
-				}
-				if (args.chain.length > 3) text += `\n  ${theme.fg("muted", `... +${args.chain.length - 3} more`)}`;
-				return new Text(text, 0, 0);
+			const metaText = (model?: string, thinking?: AgentThinkingLevel | "mixed") => {
+				const parts: string[] = [];
+				if (model) parts.push(theme.fg("accent", `[model:${model}]`));
+				if (thinking) parts.push(theme.fg("warning", `[thinking:${thinking}]`));
+				return parts.length > 0 ? ` ${parts.join(" ")}` : "";
+			};
+			const summarizeValues = <T,>(values: Array<T | undefined>): T | "mixed" | undefined => {
+				const defined = values.filter((value): value is T => value !== undefined);
+				if (defined.length === 0) return undefined;
+				return defined.every((value) => value === defined[0]) ? defined[0] : "mixed";
+			};
+			const normalized = normalizeSubagentRequest(args);
+			if (!normalized.request) {
+				return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("error", normalized.error ?? "invalid"), 0, 0);
 			}
-			if (args.tasks && args.tasks.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-					thinkingText(args.thinking);
-				for (const t of args.tasks.slice(0, 3)) {
-					const preview = wrapTaskPreview(t.task);
-					text += `\n  ${theme.fg("accent", t.agent)}${thinkingText(t.thinking)}${theme.fg("dim", ` ${preview}`)}`;
+			const request = normalized.request;
+			const discoveredAgents = resolveAvailableAgents(process.cwd(), request.items).agents;
+			const itemMetas = request.items.map((item) => {
+				const agentMeta = getRequestedAgentHeaderMeta(discoveredAgents, item.agent);
+				return {
+					...agentMeta,
+					thinking: (item.thinking ?? agentMeta.thinking ?? args.thinking) as AgentThinkingLevel | undefined,
+				};
+			});
+			const title = request.mode === "chain"
+				? `chain (${request.items.length} steps)`
+				: request.mode === "parallel"
+					? `parallel (${request.items.length} tasks)`
+					: itemMetas[0]?.name ?? getAgentDisplayName(request.items[0]?.agent ?? "...");
+			const topMeta = request.mode === "single"
+				? { model: itemMetas[0]?.model, thinking: itemMetas[0]?.thinking }
+				: {
+					model: summarizeValues(itemMetas.map((meta) => meta.model)),
+					thinking: summarizeValues(itemMetas.map((meta) => meta.thinking)),
+				};
+			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", title) + metaText(topMeta.model, topMeta.thinking);
+			for (let i = 0; i < Math.min(request.items.length, request.mode === "single" ? 1 : 3); i++) {
+				const item = request.items[i];
+				const cleanTask = request.mode === "chain" ? item.task.replace(/\{previous\}/g, "").trim() : item.task;
+				const preview = wrapTaskPreview(cleanTask, request.mode === "single" ? 108 : 72, request.mode === "single" ? 4 : 3);
+				const itemMeta = itemMetas[i];
+				if (request.mode === "single") {
+					text += `\n  ${theme.fg("dim", preview)}`;
+					continue;
 				}
-				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
-				return new Text(text, 0, 0);
+				text += `\n  ${request.mode === "chain" ? `${theme.fg("muted", `${i + 1}.`)} ` : ""}${theme.fg("accent", itemMeta.name)}${metaText(itemMeta.model, itemMeta.thinking)}${theme.fg("dim", ` ${preview}`)}`;
 			}
-			const agentName = args.agent || "...";
-			const preview = args.task ? wrapTaskPreview(args.task, 108, 4) : "...";
-			let text =
-				theme.fg("toolTitle", theme.bold("subagent ")) +
-				theme.fg("accent", agentName) +
-				thinkingText(args.thinking);
-			text += `\n  ${theme.fg("dim", preview)}`;
+			if (request.mode !== "single" && request.items.length > 3) text += `\n  ${theme.fg("muted", `... +${request.items.length - 3} more`)}`;
 			return new Text(text, 0, 0);
 		},
 
@@ -1033,6 +1168,15 @@ export default function (pi: ExtensionAPI) {
 				if (summaryLines.todo) parts.push(theme.fg("muted", summaryLines.todo));
 				return parts.length > 0 ? `${parts.join("\n")}\n\n` : "";
 			};
+			const summarizeValues = <T,>(values: Array<T | undefined>): T | "mixed" | undefined => {
+				const defined = values.filter((value): value is T => value !== undefined);
+				if (defined.length === 0) return undefined;
+				return defined.every((value) => value === defined[0]) ? defined[0] : "mixed";
+			};
+			const sharedResultMeta = (results: SingleResult[]) => ({
+				model: summarizeValues(results.map((r) => r.model)),
+				thinking: summarizeValues(results.map((r) => r.thinkingLevel)),
+			});
 
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
@@ -1046,6 +1190,7 @@ export default function (pi: ExtensionAPI) {
 					const container = new Container();
 					appendSummaryHeader(container);
 					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+					if (r.model) header += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
 					if (r.thinkingLevel) header += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
 					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
@@ -1083,6 +1228,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				let text = `${buildSummaryPrefix()}${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+				if (r.model) text += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
 				if (r.thinkingLevel) text += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				if (isError && errorText) text += `\n${theme.fg("error", `Error: ${errorText}`)}`;
@@ -1112,20 +1258,19 @@ export default function (pi: ExtensionAPI) {
 			if (details.mode === "chain") {
 				const successCount = details.results.filter((r) => r.exitCode === 0).length;
 				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
+				const topMeta = sharedResultMeta(details.results);
 
 				if (expanded) {
 					const container = new Container();
 					appendSummaryHeader(container);
-					container.addChild(
-						new Text(
-							icon +
-								" " +
-								theme.fg("toolTitle", theme.bold("chain ")) +
-								theme.fg("accent", `${successCount}/${details.results.length} steps`),
-							0,
-							0,
-						),
-					);
+					let chainHeader =
+						icon +
+						" " +
+						theme.fg("toolTitle", theme.bold("chain ")) +
+						theme.fg("accent", `${successCount}/${details.results.length} steps`);
+					if (topMeta.model) chainHeader += ` ${theme.fg("accent", `[model:${topMeta.model}]`)}`;
+					if (topMeta.thinking) chainHeader += ` ${theme.fg("warning", `[thinking:${topMeta.thinking}]`)}`;
+					container.addChild(new Text(chainHeader, 0, 0));
 
 					for (const r of details.results) {
 						const rIsError = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
@@ -1136,6 +1281,7 @@ export default function (pi: ExtensionAPI) {
 
 						container.addChild(new Spacer(1));
 						let stepHeader = `${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}`;
+						if (r.model) stepHeader += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
 						if (r.thinkingLevel) stepHeader += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
 						container.addChild(new Text(stepHeader, 0, 0));
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
@@ -1179,12 +1325,15 @@ export default function (pi: ExtensionAPI) {
 					" " +
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
+				if (topMeta.model) text += ` ${theme.fg("accent", `[model:${topMeta.model}]`)}`;
+				if (topMeta.thinking) text += ` ${theme.fg("warning", `[thinking:${topMeta.thinking}]`)}`;
 				for (const r of details.results) {
 					const rIsError = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
 					const rIcon = rIsError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
 					const errorText = rIsError ? getResultErrorText(r) : "";
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
+					if (r.model) text += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
 					if (r.thinkingLevel) text += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
 					if (rIsError && errorText) text += `\n${theme.fg("error", `Error: ${errorText}`)}`;
 					else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
@@ -1202,6 +1351,7 @@ export default function (pi: ExtensionAPI) {
 				const running = details.results.filter((r) => r.exitCode === -1).length;
 				const failCount = details.results.filter(isFailedResult).length;
 				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
+				const topMeta = sharedResultMeta(details.results);
 				const isRunning = running > 0;
 				const icon = isRunning
 					? theme.fg("warning", "⏳")
@@ -1215,13 +1365,10 @@ export default function (pi: ExtensionAPI) {
 				if (expanded && !isRunning) {
 					const container = new Container();
 					appendSummaryHeader(container);
-					container.addChild(
-						new Text(
-							`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
-							0,
-							0,
-						),
-					);
+					let parallelHeader = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
+					if (topMeta.model) parallelHeader += ` ${theme.fg("accent", `[model:${topMeta.model}]`)}`;
+					if (topMeta.thinking) parallelHeader += ` ${theme.fg("warning", `[thinking:${topMeta.thinking}]`)}`;
+					container.addChild(new Text(parallelHeader, 0, 0));
 
 					for (const r of details.results) {
 						const rIsError = isFailedResult(r);
@@ -1232,6 +1379,7 @@ export default function (pi: ExtensionAPI) {
 
 						container.addChild(new Spacer(1));
 						let taskHeader = `${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`;
+						if (r.model) taskHeader += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
 						if (r.thinkingLevel) taskHeader += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
 						container.addChild(new Text(taskHeader, 0, 0));
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
@@ -1270,6 +1418,8 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				let text = `${buildSummaryPrefix()}${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
+				if (topMeta.model) text += ` ${theme.fg("accent", `[model:${topMeta.model}]`)}`;
+				if (topMeta.thinking) text += ` ${theme.fg("warning", `[thinking:${topMeta.thinking}]`)}`;
 				for (const r of details.results) {
 					const rIsError = isFailedResult(r);
 					const rIcon =
@@ -1281,6 +1431,7 @@ export default function (pi: ExtensionAPI) {
 					const displayItems = getDisplayItems(r.messages);
 					const errorText = rIsError ? getResultErrorText(r) : "";
 					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
+					if (r.model) text += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
 					if (r.thinkingLevel) text += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
 					if (rIsError && errorText) text += `\n${theme.fg("error", `Error: ${errorText}`)}`;
 					else if (displayItems.length === 0)
