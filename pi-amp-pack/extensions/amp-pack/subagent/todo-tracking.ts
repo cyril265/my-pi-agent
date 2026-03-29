@@ -1,13 +1,9 @@
-import * as path from "node:path";
-import { randomUUID } from "node:crypto";
-import { Queue, mergeMetadata, type Item } from "../../../sq-node/dist/index.js";
+import { Queue, mergeMetadata, resolveQueuePath, type Item } from "../../../sq-node/dist/index.js";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 
 const MAX_TODO_TEXT_CHARS = 2400;
 const MAX_TODO_SUMMARY_CHARS = 8000;
-const MAIN_TODO_RELATIVE_PATH = path.join(".sift", "todos.json");
-const SUBAGENT_RUN_QUEUE_FILE_NAME = "queue.jsonl";
 
 export interface TodoTrackingSingleResult {
 	exitCode: number;
@@ -27,22 +23,6 @@ export interface LoadedTrackedRun {
 	queuePath: string;
 	run: Item;
 	tasks: Item[];
-}
-
-export function resolveMainTodoQueuePath(cwd: string): string {
-	return path.resolve(cwd, MAIN_TODO_RELATIVE_PATH);
-}
-
-export function resolveSubagentRunDirectory(cwd: string, runId: string): string {
-	return path.resolve(cwd, ".sift", "subagents", runId);
-}
-
-export function resolveSubagentRunQueuePath(cwd: string, runId: string): string {
-	return path.join(resolveSubagentRunDirectory(cwd, runId), SUBAGENT_RUN_QUEUE_FILE_NAME);
-}
-
-function createSubagentRunId(): string {
-	return randomUUID();
 }
 
 function truncateText(text: string, maxChars: number): string {
@@ -83,15 +63,16 @@ function sortTrackedTasks(tasks: Item[]): Item[] {
 }
 
 export async function loadTrackedRun(defaultCwd: string, runId: string): Promise<LoadedTrackedRun | null> {
-	const queuePath = resolveSubagentRunQueuePath(defaultCwd, runId);
+	const queuePath = resolveQueuePath({ cwd: defaultCwd, env: process.env });
 	const queue = new Queue(queuePath);
 	const items = await queue.allWithComputedStatus();
-	const run = items.find((item) => item.metadata.kind === "subagent_run" && getSubagentMetadata(item).runId === runId);
+	const run = items.find((item) => item.metadata.kind === "subagent_run" && (item.id === runId || getSubagentMetadata(item).runId === runId));
 	if (!run) return null;
+	const persistedRunId = typeof getSubagentMetadata(run).runId === "string" ? String(getSubagentMetadata(run).runId) : run.id;
 	const tasks = sortTrackedTasks(
-		items.filter((item) => item.metadata.kind === "subagent_task" && getSubagentMetadata(item).runId === runId),
+		items.filter((item) => item.metadata.kind === "subagent_task" && getSubagentMetadata(item).runId === persistedRunId),
 	);
-	return { runId, queuePath, run, tasks };
+	return { runId: persistedRunId, queuePath, run, tasks };
 }
 
 export class SqTodoTracker {
@@ -100,10 +81,9 @@ export class SqTodoTracker {
 	private readonly mode: "single" | "parallel" | "chain";
 	private readonly runTitle: string;
 	private readonly toolCallId: string;
-	private readonly runId: string;
 	private readonly warnings: string[] = [];
 	private readonly taskIds = new Map<string, string>();
-	private runItemId: string | undefined;
+	private runId: string | undefined;
 	private disabledReason: string | undefined;
 	private finalized = false;
 
@@ -112,14 +92,12 @@ export class SqTodoTracker {
 		mode: "single" | "parallel" | "chain",
 		runTitle: string,
 		toolCallId: string,
-		runId: string,
 	) {
 		this.queuePath = queuePath;
 		this.queue = new Queue(queuePath);
 		this.mode = mode;
 		this.runTitle = runTitle;
 		this.toolCallId = toolCallId;
-		this.runId = runId;
 	}
 
 	static async create(
@@ -128,12 +106,15 @@ export class SqTodoTracker {
 		toolCallId: string,
 		runTitle: string | undefined,
 	): Promise<SqTodoTracker | null> {
-		const runId = createSubagentRunId();
-		const queuePath = resolveSubagentRunQueuePath(queueResolveCwd, runId);
-		const resolvedRunTitle = runTitle?.trim() ? runTitle.trim() : `Subagent ${mode} run`;
-		const tracker = new SqTodoTracker(queuePath, mode, resolvedRunTitle, toolCallId, runId);
-		await tracker.initialize();
-		return tracker;
+		try {
+			const queuePath = resolveQueuePath({ cwd: queueResolveCwd, env: process.env });
+			const resolvedRunTitle = runTitle?.trim() ? runTitle.trim() : `Subagent ${mode} run`;
+			const tracker = new SqTodoTracker(queuePath, mode, resolvedRunTitle, toolCallId);
+			await tracker.initialize();
+			return tracker;
+		} catch {
+			return null;
+		}
 	}
 
 	getRunId(): string | undefined {
@@ -158,7 +139,6 @@ export class SqTodoTracker {
 				metadata: {
 					kind: "subagent_run",
 					subagent: {
-						runId: this.runId,
 						state: "queued",
 						mode: this.mode,
 						toolCallId: this.toolCallId,
@@ -169,14 +149,19 @@ export class SqTodoTracker {
 				sources: [],
 				blocked_by: [],
 			});
-			this.runItemId = item.id;
+			this.runId = item.id;
+			await this.mergeItemMetadata(item.id, {
+				subagent: {
+					runId: item.id,
+				},
+			});
 		} catch (error) {
 			this.disabledReason = error instanceof Error ? error.message : String(error);
 		}
 	}
 
 	isActive(): boolean {
-		return Boolean(this.runItemId) && !this.disabledReason;
+		return Boolean(this.runId) && !this.disabledReason;
 	}
 
 	private async setItemStatus(itemId: string, status: "pending" | "in_progress" | "closed") {
@@ -205,23 +190,13 @@ export class SqTodoTracker {
 	}
 
 	async markRunStarted(extra: Record<string, unknown> = {}) {
-		if (!this.isActive() || !this.runItemId) return;
-		await this.setItemStatus(this.runItemId, "in_progress");
-		await this.mergeItemMetadata(this.runItemId, {
+		if (!this.isActive() || !this.runId) return;
+		await this.setItemStatus(this.runId, "in_progress");
+		await this.mergeItemMetadata(this.runId, {
 			subagent: {
 				state: "running",
 				startedAt: new Date().toISOString(),
 				...extra,
-			},
-		});
-	}
-
-	async markCancellationRequested() {
-		if (!this.isActive() || !this.runItemId) return;
-		await this.mergeItemMetadata(this.runItemId, {
-			subagent: {
-				cancellationRequestedAt: new Date().toISOString(),
-				cancellationRequested: true,
 			},
 		});
 	}
@@ -244,7 +219,7 @@ export class SqTodoTracker {
 		step: number | undefined,
 		blockedByIds: string[],
 	) {
-		if (!this.isActive() || this.taskIds.has(taskKey) || !this.runItemId) return;
+		if (!this.isActive() || this.taskIds.has(taskKey) || !this.runId) return;
 
 		const titlePrefix = this.mode === "chain" && step ? `Step ${step}` : this.mode === "parallel" ? "Parallel" : "Task";
 		try {
@@ -255,11 +230,9 @@ export class SqTodoTracker {
 				metadata: {
 					kind: "subagent_task",
 					runId: this.runId,
-					runItemId: this.runItemId,
 					taskKey,
 					subagent: {
 						runId: this.runId,
-						runItemId: this.runItemId,
 						state: "running",
 						mode: this.mode,
 						taskKey,
@@ -277,18 +250,6 @@ export class SqTodoTracker {
 		} catch {
 			this.addWarning(`sq add task for ${agent} failed`);
 		}
-	}
-
-	async noteTaskProcess(taskKey: string, pid: number | undefined) {
-		if (!this.isActive() || !pid) return;
-		const taskId = this.taskIds.get(taskKey);
-		if (!taskId) return;
-		await this.mergeItemMetadata(taskId, {
-			subagent: {
-				pid,
-				processStartedAt: new Date().toISOString(),
-			},
-		});
 	}
 
 	async finishTask(taskKey: string, result: TodoTrackingSingleResult, forcedOutcome?: TrackedRunOutcome) {
@@ -337,9 +298,9 @@ export class SqTodoTracker {
 	async finalize(outcome: TrackedRunOutcome, summary: string) {
 		if (this.finalized) return;
 		this.finalized = true;
-		if (!this.isActive() || !this.runItemId) return;
+		if (!this.isActive() || !this.runId) return;
 
-		await this.mergeItemMetadata(this.runItemId, {
+		await this.mergeItemMetadata(this.runId, {
 			subagent: {
 				state: outcome,
 				finishedAt: new Date().toISOString(),
@@ -350,12 +311,12 @@ export class SqTodoTracker {
 			},
 		});
 
-		await this.setItemStatus(this.runItemId, outcome === "failed" ? "pending" : "closed");
+		await this.setItemStatus(this.runId, outcome === "failed" ? "pending" : "closed");
 	}
 
 	statusNote(): string | undefined {
 		if (this.disabledReason) return `disabled: ${this.disabledReason}`;
-		if (!this.runItemId) return undefined;
+		if (!this.runId) return undefined;
 		if (this.warnings.length > 0) {
 			return `run ${this.runId} (${this.queuePath}) with ${this.warnings.length} warning(s)`;
 		}

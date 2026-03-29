@@ -51,9 +51,7 @@ The `subagent` tool accepts:
 Async runs keep the caller free to continue coordinating while delegated work runs in the background.
 
 - `subagent_start` starts a background run and returns a `runId`
-- `subagent_status` shows the latest progress for a `runId`
-- `subagent_results` shows the latest or final output for a `runId`
-- `subagent_cancel` requests cancellation for a live `runId`
+- `subagent_status` shows live progress while the session is active, then falls back to the persisted run summary
 
 ## Subagent Todo Tracking
 
@@ -61,12 +59,9 @@ Todo tracking is always attempted on the `subagent` and `subagent_start` tools.
 
 The extension creates one run item and one task item per delegated subagent task/step, updates status during execution, and closes successful items using the bundled `sq-node` library when queue setup succeeds.
 
-Queue layout:
+Queue resolution reuses `sq-node`'s existing `resolveQueuePath()` behavior, so the default queue remains `.sift/issues.jsonl` unless `SQ_QUEUE_PATH` or an existing linked-worktree queue says otherwise.
 
-- Main agent default sq todo path: `.sift/todos.json`
-- Per-subagent run path: `.sift/subagents/<runId>/queue.jsonl`
-
-Async runs extend that same tracking model so `sq` becomes the durable source of truth for run ids, lifecycle state, task outcomes, cancellation requests, summaries, and lightweight process metadata.
+Async runs persist their run record and task summaries in that same main queue. While the originating session is still alive, `subagent_status` also shows richer in-memory progress.
 
 ## Third-party Notices
 

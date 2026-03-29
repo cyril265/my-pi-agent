@@ -28,7 +28,6 @@ import {
 	extractSummaryLines,
 	getResultSummaryText,
 	loadTrackedRun,
-	resolveMainTodoQueuePath,
 	withTodoTrackingNote,
 } from "./todo-tracking.js";
 
@@ -521,9 +520,6 @@ interface BackgroundRunRecord {
 	completedAt?: string;
 	latest?: AgentToolResult<SubagentDetails>;
 	final?: AgentToolResult<SubagentDetails>;
-	abortController: AbortController;
-	tracker: SqTodoTracker | null;
-	promise?: Promise<void>;
 }
 
 const backgroundRuns = new Map<string, BackgroundRunRecord>();
@@ -594,7 +590,6 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	trackingQueuePath?: string,
-	onProcessStart?: (pid: number | undefined) => void,
 ): Promise<SingleResult> {
 	const resolved = buildResolvedAgent(agents, requestedAgent, preferredProvider, modelRegistry);
 	const agentName = resolved.config?.name ?? getAgentDisplayName(requestedAgent);
@@ -655,16 +650,18 @@ async function runSingleAgent(
 
 		args.push(`Task: ${task}`);
 
+		const childEnv: NodeJS.ProcessEnv = {
+			...process.env,
+			[AMP_SUBAGENT_PROCESS_ENV]: "1",
+		};
+		const resolvedQueuePath = trackingQueuePath ?? process.env.SQ_QUEUE_PATH;
+		if (resolvedQueuePath) childEnv.SQ_QUEUE_PATH = resolvedQueuePath;
+
 		const result = await runPiJsonProcess({
 			args,
 			cwd: cwd ?? defaultCwd,
-			env: {
-				...process.env,
-				[AMP_SUBAGENT_PROCESS_ENV]: "1",
-				SQ_QUEUE_PATH: trackingQueuePath ?? process.env.SQ_QUEUE_PATH ?? resolveMainTodoQueuePath(defaultCwd),
-			},
+			env: childEnv,
 			signal,
-			onSpawn: onProcessStart,
 			onEvent: (event) => {
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message as Message;
@@ -932,10 +929,6 @@ function buildRunLookup(params: { runId: string }): { runId: string; key: string
 	};
 }
 
-function applyMainTodoQueuePath(cwd: string) {
-	process.env.SQ_QUEUE_PATH = resolveMainTodoQueuePath(cwd);
-}
-
 function resolveAvailableAgents(cwd: string, items: NormalizedTaskItem[]): AgentDiscoveryResult {
 	const discoveries = new Map<string, AgentConfig>();
 	let projectAgentsDir: string | null = null;
@@ -969,7 +962,7 @@ async function buildStoredRunResult(
 		content: [
 			{
 				type: "text",
-				text: formatStoredRunSummary(params.runId, tracked.queuePath, status, mode, tasks, summary),
+				text: formatStoredRunSummary(tracked.runId, tracked.queuePath, status, mode, tasks, summary),
 			},
 		],
 		details: {
@@ -1071,7 +1064,6 @@ async function executeSubagentRequest(
 						chainUpdate,
 						makeDetails("chain"),
 						trackingQueuePath,
-						(pid) => todoTracker?.noteTaskProcess(taskKey, pid),
 					);
 					results.push(result);
 					await todoTracker?.finishTask(taskKey, result);
@@ -1172,7 +1164,6 @@ async function executeSubagentRequest(
 							},
 							makeDetails("parallel"),
 							trackingQueuePath,
-							(pid) => todoTracker?.noteTaskProcess(taskKey, pid),
 						);
 						allResults[index] = result;
 						progressTracker.finishTask(taskKey, !(result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted"));
@@ -1244,7 +1235,6 @@ async function executeSubagentRequest(
 					emitProgressUpdate,
 					makeDetails("single"),
 					trackingQueuePath,
-					(pid) => todoTracker?.noteTaskProcess(taskKey, pid),
 				);
 
 				await todoTracker?.finishTask(taskKey, result);
@@ -1344,7 +1334,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		rememberModelContext(ctx as { model?: { provider: string; id: string }; modelRegistry: ModelRegistryLookup });
 		if (process.env[AMP_SUBAGENT_PROCESS_ENV] === "1") return;
-		applyMainTodoQueuePath(ctx.cwd);
 		const hasRoutingGuidanceState = ctx
 			.sessionManager
 			.getEntries()
@@ -1362,15 +1351,6 @@ export default function (pi: ExtensionAPI) {
 		rememberModelContext({ model: event.model as { provider: string; id: string }, modelRegistry: ctx.modelRegistry as ModelRegistryLookup });
 	});
 
-	pi.on("session_switch", async (_event, ctx) => {
-		if (process.env[AMP_SUBAGENT_PROCESS_ENV] === "1") return;
-		applyMainTodoQueuePath(ctx.cwd);
-	});
-
-	pi.on("session_fork", async (_event, ctx) => {
-		if (process.env[AMP_SUBAGENT_PROCESS_ENV] === "1") return;
-		applyMainTodoQueuePath(ctx.cwd);
-	});
 
 	pi.registerTool({
 		name: "subagent_start",
@@ -1401,19 +1381,16 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const queuePath = tracker.getQueuePath();
-			const abortController = new AbortController();
 			const record: BackgroundRunRecord = {
 				runId,
 				queuePath,
 				request: normalized.request,
 				status: "queued",
 				startedAt: new Date().toISOString(),
-				abortController,
-				tracker,
 			};
 			backgroundRuns.set(buildBackgroundRunKey(runId), record);
 
-			record.promise = executeSubagentRequest(
+			void executeSubagentRequest(
 				toolCallId,
 				normalized.request,
 				ctx.cwd,
@@ -1421,10 +1398,10 @@ export default function (pi: ExtensionAPI) {
 				undefined,
 				ctx.model?.provider,
 				ctx.modelRegistry,
-				abortController.signal,
+				undefined,
 				(partial) => {
 					record.latest = partial;
-					record.status = abortController.signal.aborted ? "cancelled" : "running";
+					record.status = "running";
 				},
 				tracker,
 				{ execution: "async" },
@@ -1432,19 +1409,18 @@ export default function (pi: ExtensionAPI) {
 				.then((result) => {
 					record.latest = result;
 					record.final = result;
-					record.status = record.status === "cancelled" || abortController.signal.aborted ? "cancelled" : result.isError ? "failed" : "succeeded";
+					record.status = result.isError ? "failed" : "succeeded";
 					record.completedAt = new Date().toISOString();
 					pruneBackgroundRuns();
 				})
 				.catch((error) => {
-					const cancelled = abortController.signal.aborted;
 					record.final = {
-						content: [{ type: "text", text: cancelled ? "Subagent run cancelled." : `Subagent execution failed: ${error instanceof Error ? error.message : String(error)}` }],
+						content: [{ type: "text", text: `Subagent execution failed: ${error instanceof Error ? error.message : String(error)}` }],
 						details: { mode: normalized.request.mode, results: [] },
-						isError: !cancelled,
+						isError: true,
 					};
 					record.latest = record.final;
-					record.status = cancelled ? "cancelled" : "failed";
+					record.status = "failed";
 					record.completedAt = new Date().toISOString();
 					pruneBackgroundRuns();
 				});
@@ -1457,7 +1433,7 @@ export default function (pi: ExtensionAPI) {
 							`Started async subagent run ${runId}.`,
 							`Queue: ${queuePath}`,
 							`Mode: ${normalized.request.mode}`,
-							"Use subagent_status, subagent_results, or subagent_cancel with this runId.",
+							"Use subagent_status with this runId.",
 						].join("\n"),
 					},
 				],
@@ -1496,89 +1472,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "subagent_results",
-		label: "Subagent Results",
-		description: "Read the latest or final results for an async subagent run by run id.",
-		parameters: AsyncRunLookupParams,
-
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			pruneBackgroundRuns();
-			const live = backgroundRuns.get(buildRunLookup(params).key);
-			if (!live) return await buildStoredRunResult(ctx.cwd, params);
-
-			const base = live.final ?? live.latest ?? {
-				content: [{ type: "text", text: "(no output yet)" }],
-				details: { mode: live.request.mode, results: [] },
-			};
-			const header = [`Run: ${live.runId}`, `Status: ${getBackgroundRunStatus(live)}`, `Queue: ${live.queuePath}`, ""].join("\n");
-			const content = [...base.content];
-			const firstTextIndex = content.findIndex((part) => part.type === "text");
-			if (firstTextIndex >= 0) {
-				const current = content[firstTextIndex];
-				if (current.type === "text") content[firstTextIndex] = { ...current, text: `${header}${current.text}` };
-			} else {
-				content.unshift({ type: "text", text: header.trimEnd() });
-			}
-			return {
-				...base,
-				content,
-				isError: getBackgroundRunStatus(live) === "failed",
-			};
-		},
-	});
-
-	pi.registerTool({
-		name: "subagent_cancel",
-		label: "Subagent Cancel",
-		description: "Request cancellation for a live async subagent run by run id.",
-		parameters: AsyncRunLookupParams,
-
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			pruneBackgroundRuns();
-			const live = backgroundRuns.get(buildRunLookup(params).key);
-			if (!live) {
-				const stored = await loadTrackedRun(ctx.cwd, params.runId);
-				if (!stored) {
-					return {
-						content: [{ type: "text", text: `Run ${params.runId} was not found in the resolved sq queue.` }],
-						details: { mode: "single", results: [] },
-						isError: true,
-					};
-				}
-				const runMeta = asRecord(stored.run.metadata.subagent) ?? {};
-				const state = asString(runMeta.state) ?? stored.run.status;
-				const isFinal = state === "succeeded" || state === "failed" || state === "cancelled" || stored.run.status === "closed";
-				return {
-					content: [{ type: "text", text: isFinal ? `Run ${params.runId} is already ${state}.` : `Run ${params.runId} is not live in this session, so it cannot be cancelled here.` }],
-					details: { mode: "single", results: [] },
-					isError: !isFinal,
-				};
-			}
-
-			if (live.final) {
-				return {
-					content: [{ type: "text", text: `Run ${live.runId} is already ${getBackgroundRunStatus(live)}.` }],
-					details: live.final.details,
-				};
-			}
-			if (live.abortController.signal.aborted) {
-				return {
-					content: [{ type: "text", text: `Cancellation already requested for run ${live.runId}.` }],
-					details: live.latest?.details ?? { mode: live.request.mode, results: [] },
-				};
-			}
-
-			live.status = "cancelled";
-			live.abortController.abort();
-			await live.tracker?.markCancellationRequested();
-			return {
-				content: [{ type: "text", text: `Cancellation requested for run ${live.runId}.` }],
-				details: live.latest?.details ?? { mode: live.request.mode, results: [] },
-			};
-		},
-	});
-
-	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
@@ -1588,7 +1481,7 @@ export default function (pi: ExtensionAPI) {
 			"Each step agent can be a saved agent name or an inline generic agent object with systemPrompt, tools, model, and thinking.",
 			"Thinking is configured per step; use thinking: \"inherit\" to use the caller's current thinking level.",
 			"Uses user agents from ~/.pi/agent/agents.",
-			"Use `subagent_start` for background runs with persistent sq tracking.",
+			"Use `subagent_start` and `subagent_status` for background runs with persisted summaries.",
 		].join(" "),
 		parameters: SubagentParams,
 
