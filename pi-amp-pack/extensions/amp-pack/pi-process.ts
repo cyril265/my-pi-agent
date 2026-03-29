@@ -21,6 +21,7 @@ export interface PiJsonRunOptions {
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	onEvent?: (event: PiJsonEvent) => void;
+	onSpawn?: (pid: number | undefined) => void;
 }
 
 export interface PiJsonRunResult {
@@ -70,6 +71,7 @@ export async function runPiJsonProcess(options: PiJsonRunOptions): Promise<PiJso
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
+		options.onSpawn?.(proc.pid);
 
 		let rawStdout = "";
 		let stderr = "";

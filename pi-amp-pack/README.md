@@ -46,11 +46,27 @@ The `subagent` tool accepts:
 - `cwd`: optional default working directory for all steps
 - `runTitle`: optional tracking title for the parent run item
 
+## Async Subagent Runs
+
+Async runs keep the caller free to continue coordinating while delegated work runs in the background.
+
+- `subagent_start` starts a background run and returns a `runId`
+- `subagent_status` shows the latest progress for a `runId`
+- `subagent_results` shows the latest or final output for a `runId`
+- `subagent_cancel` requests cancellation for a live `runId`
+
 ## Subagent Todo Tracking
 
-Todo tracking is always attempted on the `subagent` tool.
+Todo tracking is always attempted on the `subagent` and `subagent_start` tools.
 
-The extension creates one run item and one task item per delegated subagent task/step, updates status during execution, and closes successful items using the bundled `sq-node` library when queue setup succeeds. The queue is resolved once per tool invocation from the top-level `cwd` when provided, otherwise from the shared resolved step `cwd` when all steps agree, else from the current working directory.
+The extension creates one run item and one task item per delegated subagent task/step, updates status during execution, and closes successful items using the bundled `sq-node` library when queue setup succeeds.
+
+Queue layout:
+
+- Main agent default sq todo path: `.sift/todos.json`
+- Per-subagent run path: `.sift/subagents/<runId>/queue.jsonl`
+
+Async runs extend that same tracking model so `sq` becomes the durable source of truth for run ids, lifecycle state, task outcomes, cancellation requests, summaries, and lightweight process metadata.
 
 ## Third-party Notices
 

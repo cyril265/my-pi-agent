@@ -1,8 +1,13 @@
-import { Queue, mergeMetadata, resolveQueuePath } from "../../../sq-node/dist/index.js";
+import * as path from "node:path";
+import { randomUUID } from "node:crypto";
+import { Queue, mergeMetadata, type Item } from "../../../sq-node/dist/index.js";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
+
 const MAX_TODO_TEXT_CHARS = 2400;
 const MAX_TODO_SUMMARY_CHARS = 8000;
+const MAIN_TODO_RELATIVE_PATH = path.join(".sift", "todos.json");
+const SUBAGENT_RUN_QUEUE_FILE_NAME = "queue.jsonl";
 
 export interface TodoTrackingSingleResult {
 	exitCode: number;
@@ -10,6 +15,34 @@ export interface TodoTrackingSingleResult {
 	stderr: string;
 	stopReason?: string;
 	errorMessage?: string;
+	model?: string;
+	thinkingLevel?: string;
+	usage?: Record<string, unknown>;
+}
+
+export type TrackedRunOutcome = "succeeded" | "failed" | "cancelled";
+
+export interface LoadedTrackedRun {
+	runId: string;
+	queuePath: string;
+	run: Item;
+	tasks: Item[];
+}
+
+export function resolveMainTodoQueuePath(cwd: string): string {
+	return path.resolve(cwd, MAIN_TODO_RELATIVE_PATH);
+}
+
+export function resolveSubagentRunDirectory(cwd: string, runId: string): string {
+	return path.resolve(cwd, ".sift", "subagents", runId);
+}
+
+export function resolveSubagentRunQueuePath(cwd: string, runId: string): string {
+	return path.join(resolveSubagentRunDirectory(cwd, runId), SUBAGENT_RUN_QUEUE_FILE_NAME);
+}
+
+function createSubagentRunId(): string {
+	return randomUUID();
 }
 
 function truncateText(text: string, maxChars: number): string {
@@ -30,15 +63,47 @@ function getFinalOutput(messages: Message[]): string {
 	return "";
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function getSubagentMetadata(item: Item): Record<string, unknown> {
+	return asRecord(item.metadata.subagent) ?? {};
+}
+
+function sortTrackedTasks(tasks: Item[]): Item[] {
+	return [...tasks].sort((left, right) => {
+		const leftMeta = getSubagentMetadata(left);
+		const rightMeta = getSubagentMetadata(right);
+		const leftStep = typeof leftMeta.step === "number" ? leftMeta.step : Number.MAX_SAFE_INTEGER;
+		const rightStep = typeof rightMeta.step === "number" ? rightMeta.step : Number.MAX_SAFE_INTEGER;
+		if (leftStep !== rightStep) return leftStep - rightStep;
+		return left.created_at.localeCompare(right.created_at);
+	});
+}
+
+export async function loadTrackedRun(defaultCwd: string, runId: string): Promise<LoadedTrackedRun | null> {
+	const queuePath = resolveSubagentRunQueuePath(defaultCwd, runId);
+	const queue = new Queue(queuePath);
+	const items = await queue.allWithComputedStatus();
+	const run = items.find((item) => item.metadata.kind === "subagent_run" && getSubagentMetadata(item).runId === runId);
+	if (!run) return null;
+	const tasks = sortTrackedTasks(
+		items.filter((item) => item.metadata.kind === "subagent_task" && getSubagentMetadata(item).runId === runId),
+	);
+	return { runId, queuePath, run, tasks };
+}
+
 export class SqTodoTracker {
 	private readonly queuePath: string;
 	private readonly queue: Queue;
 	private readonly mode: "single" | "parallel" | "chain";
 	private readonly runTitle: string;
 	private readonly toolCallId: string;
+	private readonly runId: string;
 	private readonly warnings: string[] = [];
 	private readonly taskIds = new Map<string, string>();
-	private runId: string | undefined;
+	private runItemId: string | undefined;
 	private disabledReason: string | undefined;
 	private finalized = false;
 
@@ -47,12 +112,14 @@ export class SqTodoTracker {
 		mode: "single" | "parallel" | "chain",
 		runTitle: string,
 		toolCallId: string,
+		runId: string,
 	) {
 		this.queuePath = queuePath;
 		this.queue = new Queue(queuePath);
 		this.mode = mode;
 		this.runTitle = runTitle;
 		this.toolCallId = toolCallId;
+		this.runId = runId;
 	}
 
 	static async create(
@@ -61,15 +128,20 @@ export class SqTodoTracker {
 		toolCallId: string,
 		runTitle: string | undefined,
 	): Promise<SqTodoTracker | null> {
-		try {
-			const queuePath = resolveQueuePath({ cwd: queueResolveCwd });
-			const resolvedRunTitle = runTitle?.trim() ? runTitle.trim() : `Subagent ${mode} run`;
-			const tracker = new SqTodoTracker(queuePath, mode, resolvedRunTitle, toolCallId);
-			await tracker.initialize();
-			return tracker;
-		} catch {
-			return null;
-		}
+		const runId = createSubagentRunId();
+		const queuePath = resolveSubagentRunQueuePath(queueResolveCwd, runId);
+		const resolvedRunTitle = runTitle?.trim() ? runTitle.trim() : `Subagent ${mode} run`;
+		const tracker = new SqTodoTracker(queuePath, mode, resolvedRunTitle, toolCallId, runId);
+		await tracker.initialize();
+		return tracker;
+	}
+
+	getRunId(): string | undefined {
+		return this.runId;
+	}
+
+	getQueuePath(): string {
+		return this.queuePath;
 	}
 
 	private addWarning(message: string) {
@@ -79,38 +151,40 @@ export class SqTodoTracker {
 
 	private async initialize() {
 		try {
+			const requestedAt = new Date().toISOString();
 			const item = await this.queue.push({
 				title: this.runTitle,
 				description: `Tracking run for subagent ${this.mode} mode`,
 				metadata: {
 					kind: "subagent_run",
-					mode: this.mode,
-					toolCallId: this.toolCallId,
-					startedAt: new Date().toISOString(),
+					subagent: {
+						runId: this.runId,
+						state: "queued",
+						mode: this.mode,
+						toolCallId: this.toolCallId,
+						queuePath: this.queuePath,
+						requestedAt,
+					},
 				},
 				sources: [],
 				blocked_by: [],
 			});
-			this.runId = item.id;
+			this.runItemId = item.id;
 		} catch (error) {
 			this.disabledReason = error instanceof Error ? error.message : String(error);
 		}
 	}
 
 	isActive(): boolean {
-		return Boolean(this.runId) && !this.disabledReason;
+		return Boolean(this.runItemId) && !this.disabledReason;
 	}
 
-	private isTaskFailure(result: TodoTrackingSingleResult): boolean {
-		return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-	}
-
-	private async setTaskStatus(taskId: string, status: "pending" | "in_progress") {
+	private async setItemStatus(itemId: string, status: "pending" | "in_progress" | "closed") {
 		try {
-			const updated = await this.queue.update(taskId, { status });
-			if (!updated) this.addWarning(`sq update ${taskId} status ${status} failed`);
+			const updated = status === "closed" ? await this.queue.close(itemId) : await this.queue.update(itemId, { status });
+			if (!updated) this.addWarning(`sq update ${itemId} status ${status} failed`);
 		} catch {
-			this.addWarning(`sq update ${taskId} status ${status} failed`);
+			this.addWarning(`sq update ${itemId} status ${status} failed`);
 		}
 	}
 
@@ -130,13 +204,32 @@ export class SqTodoTracker {
 		}
 	}
 
-	private async closeItem(itemId: string) {
-		try {
-			const updated = await this.queue.close(itemId);
-			if (!updated) this.addWarning(`sq close ${itemId} failed`);
-		} catch {
-			this.addWarning(`sq close ${itemId} failed`);
-		}
+	async markRunStarted(extra: Record<string, unknown> = {}) {
+		if (!this.isActive() || !this.runItemId) return;
+		await this.setItemStatus(this.runItemId, "in_progress");
+		await this.mergeItemMetadata(this.runItemId, {
+			subagent: {
+				state: "running",
+				startedAt: new Date().toISOString(),
+				...extra,
+			},
+		});
+	}
+
+	async markCancellationRequested() {
+		if (!this.isActive() || !this.runItemId) return;
+		await this.mergeItemMetadata(this.runItemId, {
+			subagent: {
+				cancellationRequestedAt: new Date().toISOString(),
+				cancellationRequested: true,
+			},
+		});
+	}
+
+	private taskOutcome(result: TodoTrackingSingleResult, forcedOutcome?: TrackedRunOutcome): TrackedRunOutcome {
+		if (forcedOutcome) return forcedOutcome;
+		if (result.stopReason === "aborted") return "cancelled";
+		return result.exitCode !== 0 || result.stopReason === "error" ? "failed" : "succeeded";
 	}
 
 	getTaskId(taskKey: string): string | undefined {
@@ -151,57 +244,80 @@ export class SqTodoTracker {
 		step: number | undefined,
 		blockedByIds: string[],
 	) {
-		if (!this.isActive() || this.taskIds.has(taskKey) || !this.runId) return;
+		if (!this.isActive() || this.taskIds.has(taskKey) || !this.runItemId) return;
 
 		const titlePrefix = this.mode === "chain" && step ? `Step ${step}` : this.mode === "parallel" ? "Parallel" : "Task";
 		try {
+			const startedAt = new Date().toISOString();
 			const item = await this.queue.push({
 				title: `${titlePrefix}: ${agent}`,
 				description: truncateText(task, MAX_TODO_TEXT_CHARS),
 				metadata: {
 					kind: "subagent_task",
 					runId: this.runId,
-					mode: this.mode,
+					runItemId: this.runItemId,
 					taskKey,
-					agent,
-					step,
-					taskCwd,
-					startedAt: new Date().toISOString(),
+					subagent: {
+						runId: this.runId,
+						runItemId: this.runItemId,
+						state: "running",
+						mode: this.mode,
+						taskKey,
+						agent,
+						step,
+						taskCwd,
+						startedAt,
+					},
 				},
 				sources: [],
 				blocked_by: blockedByIds,
 			});
 			this.taskIds.set(taskKey, item.id);
-			await this.setTaskStatus(item.id, "in_progress");
+			await this.setItemStatus(item.id, "in_progress");
 		} catch {
 			this.addWarning(`sq add task for ${agent} failed`);
 		}
 	}
 
-	async finishTask(taskKey: string, result: TodoTrackingSingleResult) {
+	async noteTaskProcess(taskKey: string, pid: number | undefined) {
+		if (!this.isActive() || !pid) return;
+		const taskId = this.taskIds.get(taskKey);
+		if (!taskId) return;
+		await this.mergeItemMetadata(taskId, {
+			subagent: {
+				pid,
+				processStartedAt: new Date().toISOString(),
+			},
+		});
+	}
+
+	async finishTask(taskKey: string, result: TodoTrackingSingleResult, forcedOutcome?: TrackedRunOutcome) {
 		if (!this.isActive()) return;
 		const taskId = this.taskIds.get(taskKey);
 		if (!taskId) return;
 
-		const failed = this.isTaskFailure(result);
+		const outcome = this.taskOutcome(result, forcedOutcome);
 		const output = truncateText(getFinalOutput(result.messages), MAX_TODO_SUMMARY_CHARS);
 		const errorText = truncateText(result.errorMessage || result.stderr || "", MAX_TODO_SUMMARY_CHARS);
 		await this.mergeItemMetadata(taskId, {
 			subagent: {
+				state: outcome,
 				finishedAt: new Date().toISOString(),
-				outcome: failed ? "failed" : "succeeded",
+				outcome,
 				exitCode: result.exitCode,
 				stopReason: result.stopReason,
 				error: errorText || undefined,
 				output: output || undefined,
+				model: result.model,
+				thinkingLevel: result.thinkingLevel,
+				usage: result.usage,
 			},
 		});
 
-		if (failed) await this.setTaskStatus(taskId, "pending");
-		else await this.closeItem(taskId);
+		await this.setItemStatus(taskId, outcome === "failed" ? "pending" : "closed");
 	}
 
-	async finishTaskWithError(taskKey: string, error: unknown) {
+	async finishTaskWithError(taskKey: string, error: unknown, outcome: Exclude<TrackedRunOutcome, "succeeded"> = "failed") {
 		if (!this.isActive()) return;
 		const taskId = this.taskIds.get(taskKey);
 		if (!taskId) return;
@@ -209,36 +325,37 @@ export class SqTodoTracker {
 		const message = error instanceof Error ? error.message : String(error);
 		await this.mergeItemMetadata(taskId, {
 			subagent: {
+				state: outcome,
 				finishedAt: new Date().toISOString(),
-				outcome: "failed",
+				outcome,
 				error: truncateText(message, MAX_TODO_SUMMARY_CHARS),
 			},
 		});
-		await this.setTaskStatus(taskId, "pending");
+		await this.setItemStatus(taskId, outcome === "failed" ? "pending" : "closed");
 	}
 
-	async finalize(succeeded: boolean, summary: string) {
+	async finalize(outcome: TrackedRunOutcome, summary: string) {
 		if (this.finalized) return;
 		this.finalized = true;
-		if (!this.isActive() || !this.runId) return;
+		if (!this.isActive() || !this.runItemId) return;
 
-		await this.mergeItemMetadata(this.runId, {
+		await this.mergeItemMetadata(this.runItemId, {
 			subagent: {
+				state: outcome,
 				finishedAt: new Date().toISOString(),
-				outcome: succeeded ? "succeeded" : "failed",
+				outcome,
 				summary: truncateText(summary, MAX_TODO_SUMMARY_CHARS),
 				taskCount: this.taskIds.size,
 				warnings: this.warnings,
 			},
 		});
 
-		if (succeeded) await this.closeItem(this.runId);
-		else await this.setTaskStatus(this.runId, "pending");
+		await this.setItemStatus(this.runItemId, outcome === "failed" ? "pending" : "closed");
 	}
 
 	statusNote(): string | undefined {
 		if (this.disabledReason) return `disabled: ${this.disabledReason}`;
-		if (!this.runId) return undefined;
+		if (!this.runItemId) return undefined;
 		if (this.warnings.length > 0) {
 			return `run ${this.runId} (${this.queuePath}) with ${this.warnings.length} warning(s)`;
 		}

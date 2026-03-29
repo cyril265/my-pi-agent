@@ -23,12 +23,21 @@ import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { runPiJsonProcess, writePromptToTempFile } from "../pi-process";
 import { type AgentConfig, type AgentDiscoveryResult, type AgentThinkingLevel, discoverAgents } from "./agents.js";
-import { SqTodoTracker, extractSummaryLines, getResultSummaryText, withTodoTrackingNote } from "./todo-tracking.js";
+import {
+	SqTodoTracker,
+	extractSummaryLines,
+	getResultSummaryText,
+	loadTrackedRun,
+	resolveMainTodoQueuePath,
+	withTodoTrackingNote,
+} from "./todo-tracking.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const MAX_CHAIN_PREVIOUS_CHARS = 12000;
+const COMPLETED_BACKGROUND_RUN_TTL_MS = 30 * 60 * 1000;
+const MAX_COMPLETED_BACKGROUND_RUNS = 24;
 const AMP_SUBAGENT_PROCESS_ENV = "PI_AMP_SUBAGENT";
 const AMP_ROUTING_GUIDANCE_STATE = "amp-routing-guidance-state";
 
@@ -487,6 +496,38 @@ interface GenericAgentSpec {
 
 type RequestedAgent = string | GenericAgentSpec;
 
+interface NormalizedTaskItem {
+	agent: RequestedAgent;
+	task: string;
+	thinking?: AgentThinkingLevel;
+	cwd?: string;
+}
+
+interface NormalizedSubagentRequest {
+	mode: "single" | "parallel" | "chain";
+	items: NormalizedTaskItem[];
+	trackingCwd: string;
+	runTitle?: string;
+}
+
+type BackgroundRunState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+interface BackgroundRunRecord {
+	runId: string;
+	queuePath: string;
+	request: NormalizedSubagentRequest;
+	status: BackgroundRunState;
+	startedAt: string;
+	completedAt?: string;
+	latest?: AgentToolResult<SubagentDetails>;
+	final?: AgentToolResult<SubagentDetails>;
+	abortController: AbortController;
+	tracker: SqTodoTracker | null;
+	promise?: Promise<void>;
+}
+
+const backgroundRuns = new Map<string, BackgroundRunRecord>();
+
 interface ResolvedAgentConfig {
 	name: string;
 	source: AgentSource;
@@ -552,6 +593,8 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	trackingQueuePath?: string,
+	onProcessStart?: (pid: number | undefined) => void,
 ): Promise<SingleResult> {
 	const resolved = buildResolvedAgent(agents, requestedAgent, preferredProvider, modelRegistry);
 	const agentName = resolved.config?.name ?? getAgentDisplayName(requestedAgent);
@@ -615,8 +658,13 @@ async function runSingleAgent(
 		const result = await runPiJsonProcess({
 			args,
 			cwd: cwd ?? defaultCwd,
-			env: { ...process.env, [AMP_SUBAGENT_PROCESS_ENV]: "1" },
+			env: {
+				...process.env,
+				[AMP_SUBAGENT_PROCESS_ENV]: "1",
+				SQ_QUEUE_PATH: trackingQueuePath ?? process.env.SQ_QUEUE_PATH ?? resolveMainTodoQueuePath(defaultCwd),
+			},
 			signal,
+			onSpawn: onProcessStart,
 			onEvent: (event) => {
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message as Message;
@@ -649,7 +697,10 @@ async function runSingleAgent(
 
 		currentResult.stderr = result.stderr;
 		currentResult.exitCode = result.exitCode;
-		if (result.aborted) throw new Error("Subagent was aborted");
+		if (result.aborted) {
+			currentResult.stopReason ??= "aborted";
+			currentResult.errorMessage ??= "Subagent was aborted";
+		}
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -715,20 +766,9 @@ interface StepInput {
 	cwd?: string;
 }
 
-interface AgentInvocation {
-	taskCwd: string;
-	discovery: AgentDiscoveryResult;
-}
-
 function resolveInvocationCwd(defaultCwd: string, requestedCwd: string | undefined): string {
 	if (!requestedCwd) return defaultCwd;
 	return path.isAbsolute(requestedCwd) ? requestedCwd : path.resolve(defaultCwd, requestedCwd);
-}
-
-function resolveAgentInvocation(defaultCwd: string, _requestedAgent: RequestedAgent, requestedCwd: string | undefined): AgentInvocation {
-	const taskCwd = resolveInvocationCwd(defaultCwd, requestedCwd);
-	const discovery = discoverAgents(taskCwd, "user");
-	return { taskCwd, discovery };
 }
 
 function getSubagentMode(params: { steps: StepInput[]; sequential?: boolean }): "single" | "parallel" | "chain" {
@@ -750,6 +790,507 @@ function resolveTrackingCwd(params: { steps: StepInput[]; cwd?: string }, sessio
 	if (params.cwd) return resolveInvocationCwd(sessionCwd, params.cwd);
 	const resolvedStepCwds = [...new Set(params.steps.map((step) => resolveStepCwd(step, params, sessionCwd)))];
 	return resolvedStepCwds.length === 1 ? resolvedStepCwds[0]! : sessionCwd;
+}
+
+const AsyncRunLookupParams = Type.Object(
+	{
+		runId: Type.String({ description: "Run id returned by subagent_start." }),
+	},
+	{ additionalProperties: false },
+);
+
+function normalizeSubagentRequest(
+	params: { steps: StepInput[]; sequential?: boolean; cwd?: string; runTitle?: string },
+	sessionCwd: string,
+): { request?: NormalizedSubagentRequest; error?: string } {
+	const validationError = validateSubagentParams(params);
+	if (validationError) return { error: validationError };
+	const mode = getSubagentMode(params);
+	return {
+		request: {
+			mode,
+			items: params.steps.map((step) => ({
+				agent: step.agent,
+				task: step.task,
+				thinking: step.thinking,
+				cwd: resolveStepCwd(step, params, sessionCwd),
+			})),
+			trackingCwd: resolveTrackingCwd(params, sessionCwd),
+			runTitle: params.runTitle?.trim() || undefined,
+		},
+	};
+}
+
+function buildBackgroundRunKey(runId: string): string {
+	return runId;
+}
+
+function getAvailableAgentsText(cwd: string): string {
+	const discovery = discoverAgents(cwd, "user");
+	return discovery.agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+}
+
+function getBackgroundRunStatus(record: BackgroundRunRecord): BackgroundRunState {
+	if (record.final?.isError) {
+		return record.status === "cancelled" ? "cancelled" : "failed";
+	}
+	return record.status;
+}
+
+function pruneBackgroundRuns(now = Date.now()) {
+	const completed: Array<{ key: string; completedAt: number }> = [];
+	for (const [key, record] of backgroundRuns.entries()) {
+		if (!record.completedAt) continue;
+		const completedAt = Date.parse(record.completedAt);
+		if (!Number.isNaN(completedAt) && now - completedAt > COMPLETED_BACKGROUND_RUN_TTL_MS) {
+			backgroundRuns.delete(key);
+			continue;
+		}
+		completed.push({ key, completedAt: Number.isNaN(completedAt) ? now : completedAt });
+	}
+
+	if (completed.length <= MAX_COMPLETED_BACKGROUND_RUNS) return;
+	completed
+		.sort((left, right) => left.completedAt - right.completedAt)
+		.slice(0, completed.length - MAX_COMPLETED_BACKGROUND_RUNS)
+		.forEach((entry) => backgroundRuns.delete(entry.key));
+}
+
+function summarizeTrackedTasks(tasks: Array<Record<string, unknown>>): {
+	total: number;
+	succeeded: number;
+	failed: number;
+	cancelled: number;
+	running: number;
+	queued: number;
+} {
+	const counts = { total: tasks.length, succeeded: 0, failed: 0, cancelled: 0, running: 0, queued: 0 };
+	for (const task of tasks) {
+		const state = typeof task.state === "string" ? task.state : undefined;
+		if (state === "succeeded") counts.succeeded++;
+		else if (state === "failed") counts.failed++;
+		else if (state === "cancelled") counts.cancelled++;
+		else if (state === "running") counts.running++;
+		else counts.queued++;
+	}
+	return counts;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function asString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function getStoredTaskEntries(tasks: Array<{ title?: string; description?: string; metadata: Record<string, unknown>; status: string }>) {
+	return tasks.map((task) => {
+		const subagent = asRecord(task.metadata.subagent) ?? {};
+		const output = asString(subagent.output);
+		const error = asString(subagent.error);
+		const outcome = asString(subagent.outcome) ?? (task.status === "in_progress" ? "running" : task.status === "closed" ? "succeeded" : "queued");
+		return {
+			agent: asString(subagent.agent) ?? task.title ?? "unknown",
+			task: task.description ?? "",
+			state: outcome,
+			preview: output || error || task.description || "(no output)",
+		};
+	});
+}
+
+function formatStoredRunSummary(
+	runId: string,
+	queuePath: string,
+	status: string,
+	mode: string | undefined,
+	tasks: ReturnType<typeof getStoredTaskEntries>,
+	summary?: string,
+): string {
+	const counts = summarizeTrackedTasks(tasks);
+	const lines = [
+		`Run: ${runId}`,
+		`Status: ${status}`,
+		`Queue: ${queuePath}`,
+	];
+	if (mode) lines.push(`Mode: ${mode}`);
+	lines.push(`Tasks: ${counts.succeeded} succeeded, ${counts.failed} failed, ${counts.cancelled} cancelled, ${counts.running} running, ${counts.queued} queued`);
+	if (summary) lines.push("", summary);
+	if (tasks.length > 0) {
+		lines.push(
+			"",
+			...tasks.map((task) => `[${task.agent}] ${task.state}: ${truncateText(task.preview, 160).replace(/\s+/g, " ").trim()}`),
+		);
+	}
+	return lines.join("\n");
+}
+
+function buildRunLookup(params: { runId: string }): { runId: string; key: string } {
+	return {
+		runId: params.runId,
+		key: buildBackgroundRunKey(params.runId),
+	};
+}
+
+function applyMainTodoQueuePath(cwd: string) {
+	process.env.SQ_QUEUE_PATH = resolveMainTodoQueuePath(cwd);
+}
+
+function resolveAvailableAgents(cwd: string, items: NormalizedTaskItem[]): AgentDiscoveryResult {
+	const discoveries = new Map<string, AgentConfig>();
+	let projectAgentsDir: string | null = null;
+	for (const item of items) {
+		const taskCwd = item.cwd ?? cwd;
+		const discovery = discoverAgents(taskCwd, "user");
+		projectAgentsDir ??= discovery.projectAgentsDir;
+		for (const agent of discovery.agents) discoveries.set(agent.name, agent);
+	}
+	return { agents: Array.from(discoveries.values()), projectAgentsDir };
+}
+
+async function buildStoredRunResult(
+	defaultCwd: string,
+	params: { runId: string },
+): Promise<AgentToolResult<SubagentDetails>> {
+	const tracked = await loadTrackedRun(defaultCwd, params.runId);
+	if (!tracked) {
+		return {
+			content: [{ type: "text", text: `Run ${params.runId} was not found in the resolved sq queue.` }],
+			details: { mode: "single", results: [] },
+			isError: true,
+		};
+	}
+	const runMeta = asRecord(tracked.run.metadata.subagent) ?? {};
+	const mode = asString(runMeta.mode);
+	const status = asString(runMeta.state) ?? tracked.run.status;
+	const summary = asString(runMeta.summary);
+	const tasks = getStoredTaskEntries(tracked.tasks);
+	return {
+		content: [
+			{
+				type: "text",
+				text: formatStoredRunSummary(params.runId, tracked.queuePath, status, mode, tasks, summary),
+			},
+		],
+		details: {
+			mode: mode === "parallel" || mode === "chain" || mode === "single" ? mode : "single",
+			results: [],
+		},
+		isError: status === "failed",
+	};
+}
+
+async function executeSubagentRequest(
+	toolCallId: string,
+	request: NormalizedSubagentRequest,
+	defaultCwd: string,
+	callerThinking: string | undefined,
+	callerThinkingOverride: AgentThinkingLevel | undefined,
+	preferredProvider: string | undefined,
+	modelRegistry: ModelRegistryLookup,
+	signal: AbortSignal | undefined,
+	onUpdate: OnUpdateCallback | undefined,
+	tracker?: SqTodoTracker | null,
+	runMetadata: Record<string, unknown> = {},
+): Promise<AgentToolResult<SubagentDetails>> {
+	const makeDetails =
+		(detailsMode: "single" | "parallel" | "chain") =>
+		(results: SingleResult[]): SubagentDetails => ({
+			mode: detailsMode,
+			results,
+		});
+	const availableAgents = resolveAvailableAgents(defaultCwd, request.items);
+	const plannedTasks = request.items.map((item, index) => ({
+		key: `${request.mode === "chain" ? "chain" : request.mode === "parallel" ? "parallel" : "single"}:${index}`,
+		agent: getAgentDisplayName(item.agent),
+		task: item.task,
+		step: request.mode === "chain" ? index + 1 : undefined,
+	}));
+	const progressTracker = new RunProgressTracker(request.mode, plannedTasks);
+	const emitProgressUpdate = (partial: AgentToolResult<SubagentDetails>) => onUpdate?.(attachProgressSummary(partial, progressTracker));
+	emitProgressUpdate({ content: [{ type: "text", text: "(starting...)" }], details: makeDetails(request.mode)([]) });
+
+	const todoTracker = tracker ?? await SqTodoTracker.create(request.trackingCwd, request.mode, toolCallId, request.runTitle);
+	await todoTracker?.markRunStarted(runMetadata);
+	const trackingQueuePath = todoTracker?.getQueuePath();
+
+	const finalizeAndReturn = async (
+		result: AgentToolResult<SubagentDetails>,
+		outcomeOverride?: BackgroundRunState,
+	) => {
+		const withProgress = attachProgressSummary(result, progressTracker);
+		const outcome: BackgroundRunState = outcomeOverride ?? (result.isError ? "failed" : "succeeded");
+		await todoTracker?.finalize(outcome === "cancelled" ? "cancelled" : outcome === "failed" ? "failed" : "succeeded", getResultSummaryText(withProgress));
+		return withTodoTrackingNote(withProgress, todoTracker?.statusNote());
+	};
+
+	try {
+		if (request.mode === "chain") {
+			const results: SingleResult[] = [];
+			let previousOutput = "";
+
+			for (let i = 0; i < request.items.length; i++) {
+				const step = request.items[i];
+				const taskKey = `chain:${i}`;
+				const previousTaskId = i > 0 ? todoTracker?.getTaskId(`chain:${i - 1}`) : undefined;
+				const taskCwd = step.cwd ?? defaultCwd;
+				const boundedPrevious = buildChainContext(previousOutput);
+				const taskWithContext = step.task.replace(/\{previous\}/g, boundedPrevious);
+				const agentName = getAgentDisplayName(step.agent);
+
+				await todoTracker?.startTask(taskKey, agentName, taskWithContext, taskCwd, i + 1, previousTaskId ? [previousTaskId] : []);
+				progressTracker.startTask(taskKey, agentName, taskWithContext, i + 1);
+				emitProgressUpdate({ content: [{ type: "text", text: "(running...)" }], details: makeDetails("chain")(results) });
+
+				const chainUpdate: OnUpdateCallback | undefined = onUpdate
+					? (partial) => {
+						const currentResult = partial.details?.results[0];
+						if (currentResult) {
+							const allResults = [...results, currentResult];
+							emitProgressUpdate({
+								content: partial.content,
+								details: makeDetails("chain")(allResults),
+							});
+						}
+					}
+					: undefined;
+
+				try {
+					const result = await runSingleAgent(
+						defaultCwd,
+						availableAgents.agents,
+						step.agent,
+						taskWithContext,
+						step.thinking ?? callerThinkingOverride,
+						callerThinking,
+						preferredProvider,
+						modelRegistry,
+						taskCwd,
+						i + 1,
+						signal,
+						chainUpdate,
+						makeDetails("chain"),
+						trackingQueuePath,
+						(pid) => todoTracker?.noteTaskProcess(taskKey, pid),
+					);
+					results.push(result);
+					await todoTracker?.finishTask(taskKey, result);
+					progressTracker.finishTask(taskKey, !(result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted"));
+					emitProgressUpdate({ content: [{ type: "text", text: getFinalOutput(result.messages) || "(step complete)" }], details: makeDetails("chain")(results) });
+
+					const isError =
+						result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+					if (isError) {
+						const errorMsg = getResultErrorText(result);
+						const outcome = result.stopReason === "aborted" ? "cancelled" : "failed";
+						return await finalizeAndReturn({
+							content: [{ type: "text", text: outcome === "cancelled" ? `Chain cancelled at step ${i + 1} (${agentName}).` : `Chain stopped at step ${i + 1} (${agentName}): ${errorMsg}` }],
+							details: makeDetails("chain")(results),
+							isError: outcome !== "cancelled",
+						}, outcome);
+					}
+
+					previousOutput = getFinalOutput(result.messages);
+				} catch (error) {
+					const cancelled = Boolean(signal?.aborted);
+					await todoTracker?.finishTaskWithError(taskKey, error, cancelled ? "cancelled" : "failed");
+					progressTracker.finishTask(taskKey, false);
+					emitProgressUpdate({ content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: makeDetails("chain")(results) });
+					if (cancelled) {
+						return await finalizeAndReturn({
+							content: [{ type: "text", text: `Chain cancelled at step ${i + 1} (${agentName}).` }],
+							details: makeDetails("chain")(results),
+						}, "cancelled");
+					}
+					throw error;
+				}
+			}
+
+			return await finalizeAndReturn({
+				content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
+				details: makeDetails("chain")(results),
+			});
+		}
+
+		if (request.mode === "parallel") {
+			if (request.items.length > MAX_PARALLEL_TASKS) {
+				return await finalizeAndReturn({
+					content: [{ type: "text", text: `Too many parallel tasks (${request.items.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
+					details: makeDetails("parallel")([]),
+					isError: true,
+				}, "failed");
+			}
+
+			const allResults: SingleResult[] = new Array(request.items.length);
+			for (let i = 0; i < request.items.length; i++) {
+				allResults[i] = {
+					agent: getAgentDisplayName(request.items[i].agent),
+					agentSource: "unknown",
+					task: request.items[i].task,
+					exitCode: -1,
+					messages: [],
+					stderr: "",
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+					thinkingLevel: resolveThinkingLevel(request.items[i].thinking ?? callerThinkingOverride, isGenericAgentSpec(request.items[i].agent) ? request.items[i].agent.thinking : undefined, callerThinking),
+				};
+			}
+
+			const emitParallelUpdate = (message = "(running...)") => {
+				emitProgressUpdate({
+					content: [{ type: "text", text: message }],
+					details: makeDetails("parallel")([...allResults]),
+				});
+			};
+
+			try {
+				const results = await mapWithConcurrencyLimit(request.items, MAX_CONCURRENCY, async (t, index) => {
+					if (signal?.aborted) throw new Error("Subagent was aborted");
+					const taskKey = `parallel:${index}`;
+					const taskCwd = t.cwd ?? defaultCwd;
+					const agentName = getAgentDisplayName(t.agent);
+					await todoTracker?.startTask(taskKey, agentName, t.task, taskCwd, undefined, []);
+					progressTracker.startTask(taskKey, agentName, t.task);
+					emitParallelUpdate();
+					try {
+						const result = await runSingleAgent(
+							defaultCwd,
+							availableAgents.agents,
+							t.agent,
+							t.task,
+							t.thinking ?? callerThinkingOverride,
+							callerThinking,
+							preferredProvider,
+							modelRegistry,
+							taskCwd,
+							undefined,
+							signal,
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = partial.details.results[0];
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel"),
+							trackingQueuePath,
+							(pid) => todoTracker?.noteTaskProcess(taskKey, pid),
+						);
+						allResults[index] = result;
+						progressTracker.finishTask(taskKey, !(result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted"));
+						emitParallelUpdate(getFinalOutput(result.messages) || "(task complete)");
+						await todoTracker?.finishTask(taskKey, result);
+						return result;
+					} catch (error) {
+						const cancelled = Boolean(signal?.aborted);
+						await todoTracker?.finishTaskWithError(taskKey, error, cancelled ? "cancelled" : "failed");
+						progressTracker.finishTask(taskKey, false);
+						emitParallelUpdate(error instanceof Error ? error.message : String(error));
+						throw error;
+					}
+				});
+
+				const failedResults = results.filter(
+					(r) => r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted",
+				);
+				const successCount = results.length - failedResults.length;
+				const failCount = failedResults.length;
+				const summaries = results.map((r) => {
+					const failed = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
+					const output = failed ? getResultErrorText(r) : getResultDisplayText(r);
+					const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
+					return `[${r.agent}] ${failed ? "failed" : "completed"}: ${preview || "(no output)"}`;
+				});
+
+				return await finalizeAndReturn({
+					content: [
+						{
+							type: "text",
+							text: `Parallel: ${successCount}/${results.length} succeeded${failCount > 0 ? `, ${failCount} failed` : ""}\n\n${summaries.join("\n\n")}`,
+						},
+					],
+					details: makeDetails("parallel")(results),
+					isError: failCount > 0,
+				}, failCount > 0 ? "failed" : "succeeded");
+			} catch (error) {
+				const cancelled = Boolean(signal?.aborted);
+				return await finalizeAndReturn({
+					content: [{ type: "text", text: cancelled ? "Parallel subagent run cancelled." : `Subagent execution failed: ${error instanceof Error ? error.message : String(error)}` }],
+					details: makeDetails("parallel")(allResults),
+					isError: !cancelled,
+				}, cancelled ? "cancelled" : "failed");
+			}
+		}
+
+		if (request.mode === "single") {
+			const singleItem = request.items[0];
+			const taskKey = "single:0";
+			const taskCwd = singleItem.cwd ?? defaultCwd;
+			const agentName = getAgentDisplayName(singleItem.agent);
+			await todoTracker?.startTask(taskKey, agentName, singleItem.task, taskCwd, undefined, []);
+			progressTracker.startTask(taskKey, agentName, singleItem.task);
+			emitProgressUpdate({ content: [{ type: "text", text: "(running...)" }], details: makeDetails("single")([]) });
+			try {
+				const result = await runSingleAgent(
+					defaultCwd,
+					availableAgents.agents,
+					singleItem.agent,
+					singleItem.task,
+					singleItem.thinking ?? callerThinkingOverride,
+					callerThinking,
+					preferredProvider,
+					modelRegistry,
+					taskCwd,
+					undefined,
+					signal,
+					emitProgressUpdate,
+					makeDetails("single"),
+					trackingQueuePath,
+					(pid) => todoTracker?.noteTaskProcess(taskKey, pid),
+				);
+
+				await todoTracker?.finishTask(taskKey, result);
+				progressTracker.finishTask(taskKey, !(result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted"));
+				const isError =
+					result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+				if (isError) {
+					const errorMsg = getResultErrorText(result);
+					const outcome = result.stopReason === "aborted" ? "cancelled" : "failed";
+					return await finalizeAndReturn({
+						content: [{ type: "text", text: outcome === "cancelled" ? `Subagent run cancelled (${result.agent}).` : `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
+						details: makeDetails("single")([result]),
+						isError: outcome !== "cancelled",
+					}, outcome);
+				}
+
+				return await finalizeAndReturn({
+					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+					details: makeDetails("single")([result]),
+				});
+			} catch (error) {
+				const cancelled = Boolean(signal?.aborted);
+				await todoTracker?.finishTaskWithError(taskKey, error, cancelled ? "cancelled" : "failed");
+				progressTracker.finishTask(taskKey, false);
+				emitProgressUpdate({ content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: makeDetails("single")([]) });
+				return await finalizeAndReturn({
+					content: [{ type: "text", text: cancelled ? `Subagent run cancelled (${agentName}).` : `Subagent execution failed: ${error instanceof Error ? error.message : String(error)}` }],
+					details: makeDetails("single")([]),
+					isError: !cancelled,
+				}, cancelled ? "cancelled" : "failed");
+			}
+		}
+
+		return await finalizeAndReturn({
+			content: [{ type: "text", text: "Invalid parameters." }],
+			details: makeDetails("single")([]),
+			isError: true,
+		}, "failed");
+	} catch (error) {
+		const errorMessage = error instanceof Error ? error.message : String(error);
+		return await finalizeAndReturn({
+			content: [{ type: "text", text: `Subagent execution failed: ${errorMessage}` }],
+			details: makeDetails(request.mode)([]),
+			isError: true,
+		}, signal?.aborted ? "cancelled" : "failed");
+	}
 }
 
 export default function (pi: ExtensionAPI) {
@@ -803,6 +1344,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		rememberModelContext(ctx as { model?: { provider: string; id: string }; modelRegistry: ModelRegistryLookup });
 		if (process.env[AMP_SUBAGENT_PROCESS_ENV] === "1") return;
+		applyMainTodoQueuePath(ctx.cwd);
 		const hasRoutingGuidanceState = ctx
 			.sessionManager
 			.getEntries()
@@ -820,6 +1362,222 @@ export default function (pi: ExtensionAPI) {
 		rememberModelContext({ model: event.model as { provider: string; id: string }, modelRegistry: ctx.modelRegistry as ModelRegistryLookup });
 	});
 
+	pi.on("session_switch", async (_event, ctx) => {
+		if (process.env[AMP_SUBAGENT_PROCESS_ENV] === "1") return;
+		applyMainTodoQueuePath(ctx.cwd);
+	});
+
+	pi.on("session_fork", async (_event, ctx) => {
+		if (process.env[AMP_SUBAGENT_PROCESS_ENV] === "1") return;
+		applyMainTodoQueuePath(ctx.cwd);
+	});
+
+	pi.registerTool({
+		name: "subagent_start",
+		label: "Subagent Start",
+		description: "Start an asynchronous subagent run and return immediately with a run id.",
+		parameters: SubagentParams,
+
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			rememberModelContext(ctx as { model?: { provider: string; id: string }; modelRegistry: ModelRegistryLookup });
+			pruneBackgroundRuns();
+			const normalized = normalizeSubagentRequest(params, ctx.cwd);
+			if (!normalized.request) {
+				return {
+					content: [{ type: "text", text: `${normalized.error ?? "Invalid parameters."}\nAvailable agents: ${getAvailableAgentsText(ctx.cwd)}` }],
+					details: { mode: "single", results: [] },
+					isError: true,
+				};
+			}
+
+			const tracker = await SqTodoTracker.create(normalized.request.trackingCwd, normalized.request.mode, toolCallId, normalized.request.runTitle);
+			const runId = tracker?.getRunId();
+			if (!tracker || !runId) {
+				return {
+					content: [{ type: "text", text: "Failed to initialize sq tracking for the async run." }],
+					details: { mode: normalized.request.mode, results: [] },
+					isError: true,
+				};
+			}
+
+			const queuePath = tracker.getQueuePath();
+			const abortController = new AbortController();
+			const record: BackgroundRunRecord = {
+				runId,
+				queuePath,
+				request: normalized.request,
+				status: "queued",
+				startedAt: new Date().toISOString(),
+				abortController,
+				tracker,
+			};
+			backgroundRuns.set(buildBackgroundRunKey(runId), record);
+
+			record.promise = executeSubagentRequest(
+				toolCallId,
+				normalized.request,
+				ctx.cwd,
+				pi.getThinkingLevel(),
+				undefined,
+				ctx.model?.provider,
+				ctx.modelRegistry,
+				abortController.signal,
+				(partial) => {
+					record.latest = partial;
+					record.status = abortController.signal.aborted ? "cancelled" : "running";
+				},
+				tracker,
+				{ execution: "async" },
+			)
+				.then((result) => {
+					record.latest = result;
+					record.final = result;
+					record.status = record.status === "cancelled" || abortController.signal.aborted ? "cancelled" : result.isError ? "failed" : "succeeded";
+					record.completedAt = new Date().toISOString();
+					pruneBackgroundRuns();
+				})
+				.catch((error) => {
+					const cancelled = abortController.signal.aborted;
+					record.final = {
+						content: [{ type: "text", text: cancelled ? "Subagent run cancelled." : `Subagent execution failed: ${error instanceof Error ? error.message : String(error)}` }],
+						details: { mode: normalized.request.mode, results: [] },
+						isError: !cancelled,
+					};
+					record.latest = record.final;
+					record.status = cancelled ? "cancelled" : "failed";
+					record.completedAt = new Date().toISOString();
+					pruneBackgroundRuns();
+				});
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`Started async subagent run ${runId}.`,
+							`Queue: ${queuePath}`,
+							`Mode: ${normalized.request.mode}`,
+							"Use subagent_status, subagent_results, or subagent_cancel with this runId.",
+						].join("\n"),
+					},
+				],
+				details: { mode: normalized.request.mode, results: [] },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_status",
+		label: "Subagent Status",
+		description: "Check the current status of an async subagent run by run id.",
+		parameters: AsyncRunLookupParams,
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			pruneBackgroundRuns();
+			const live = backgroundRuns.get(buildRunLookup(params).key);
+			if (!live) return await buildStoredRunResult(ctx.cwd, params);
+
+			const status = getBackgroundRunStatus(live);
+			const progress = live.latest ? extractSummaryLines(live.latest).progress : [];
+			const lines = [
+				`Run: ${live.runId}`,
+				`Status: ${status}`,
+				`Queue: ${live.queuePath}`,
+				`Mode: ${live.request.mode}`,
+			];
+			if (progress.length > 0) lines.push("", ...progress);
+			else if (live.final) lines.push("", getResultSummaryText(live.final));
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: live.latest?.details ?? { mode: live.request.mode, results: [] },
+				isError: status === "failed",
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_results",
+		label: "Subagent Results",
+		description: "Read the latest or final results for an async subagent run by run id.",
+		parameters: AsyncRunLookupParams,
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			pruneBackgroundRuns();
+			const live = backgroundRuns.get(buildRunLookup(params).key);
+			if (!live) return await buildStoredRunResult(ctx.cwd, params);
+
+			const base = live.final ?? live.latest ?? {
+				content: [{ type: "text", text: "(no output yet)" }],
+				details: { mode: live.request.mode, results: [] },
+			};
+			const header = [`Run: ${live.runId}`, `Status: ${getBackgroundRunStatus(live)}`, `Queue: ${live.queuePath}`, ""].join("\n");
+			const content = [...base.content];
+			const firstTextIndex = content.findIndex((part) => part.type === "text");
+			if (firstTextIndex >= 0) {
+				const current = content[firstTextIndex];
+				if (current.type === "text") content[firstTextIndex] = { ...current, text: `${header}${current.text}` };
+			} else {
+				content.unshift({ type: "text", text: header.trimEnd() });
+			}
+			return {
+				...base,
+				content,
+				isError: getBackgroundRunStatus(live) === "failed",
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_cancel",
+		label: "Subagent Cancel",
+		description: "Request cancellation for a live async subagent run by run id.",
+		parameters: AsyncRunLookupParams,
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			pruneBackgroundRuns();
+			const live = backgroundRuns.get(buildRunLookup(params).key);
+			if (!live) {
+				const stored = await loadTrackedRun(ctx.cwd, params.runId);
+				if (!stored) {
+					return {
+						content: [{ type: "text", text: `Run ${params.runId} was not found in the resolved sq queue.` }],
+						details: { mode: "single", results: [] },
+						isError: true,
+					};
+				}
+				const runMeta = asRecord(stored.run.metadata.subagent) ?? {};
+				const state = asString(runMeta.state) ?? stored.run.status;
+				const isFinal = state === "succeeded" || state === "failed" || state === "cancelled" || stored.run.status === "closed";
+				return {
+					content: [{ type: "text", text: isFinal ? `Run ${params.runId} is already ${state}.` : `Run ${params.runId} is not live in this session, so it cannot be cancelled here.` }],
+					details: { mode: "single", results: [] },
+					isError: !isFinal,
+				};
+			}
+
+			if (live.final) {
+				return {
+					content: [{ type: "text", text: `Run ${live.runId} is already ${getBackgroundRunStatus(live)}.` }],
+					details: live.final.details,
+				};
+			}
+			if (live.abortController.signal.aborted) {
+				return {
+					content: [{ type: "text", text: `Cancellation already requested for run ${live.runId}.` }],
+					details: live.latest?.details ?? { mode: live.request.mode, results: [] },
+				};
+			}
+
+			live.status = "cancelled";
+			live.abortController.abort();
+			await live.tracker?.markCancellationRequested();
+			return {
+				content: [{ type: "text", text: `Cancellation requested for run ${live.runId}.` }],
+				details: live.latest?.details ?? { mode: live.request.mode, results: [] },
+			};
+		},
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -830,299 +1588,32 @@ export default function (pi: ExtensionAPI) {
 			"Each step agent can be a saved agent name or an inline generic agent object with systemPrompt, tools, model, and thinking.",
 			"Thinking is configured per step; use thinking: \"inherit\" to use the caller's current thinking level.",
 			"Uses user agents from ~/.pi/agent/agents.",
-			"Todo tracking is always attempted in the nearest .sift/issues.jsonl queue for the invocation.",
+			"Use `subagent_start` for background runs with persistent sq tracking.",
 		].join(" "),
 		parameters: SubagentParams,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			rememberModelContext(ctx as { model?: { provider: string; id: string }; modelRegistry: ModelRegistryLookup });
-			const baseDiscovery = discoverAgents(ctx.cwd, "user");
 			const callerThinking = pi.getThinkingLevel();
-			const validationError = validateSubagentParams(params);
-
-			const mode = getSubagentMode(params);
-			const makeDetails =
-				(detailsMode: "single" | "parallel" | "chain") =>
-				(results: SingleResult[]): SubagentDetails => ({
-					mode: detailsMode,
-					results,
-				});
-
-			if (validationError) {
-				const available = baseDiscovery.agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+			const normalized = normalizeSubagentRequest(params, ctx.cwd);
+			if (!normalized.request) {
+				const available = getAvailableAgentsText(ctx.cwd);
 				return {
-					content: [{ type: "text", text: `Invalid parameters. ${validationError}\nAvailable agents: ${available}` }],
-					details: makeDetails("single")([]),
+					content: [{ type: "text", text: `Invalid parameters. ${normalized.error ?? "Unknown error."}\nAvailable agents: ${available}` }],
+					details: { mode: "single", results: [] },
 				};
 			}
-
-			const plannedTasks = params.steps.map((step, index) => ({
-				key: `${mode}:${index}`,
-				agent: getAgentDisplayName(step.agent),
-				task: step.task,
-				step: mode === "chain" ? index + 1 : undefined,
-			}));
-			const progressTracker = new RunProgressTracker(mode, plannedTasks);
-			const emitProgressUpdate = (partial: AgentToolResult<SubagentDetails>) => onUpdate?.(attachProgressSummary(partial, progressTracker));
-			emitProgressUpdate({ content: [{ type: "text", text: "(starting...)" }], details: makeDetails(mode)([]) });
-
-			const trackingCwd = resolveTrackingCwd(params, ctx.cwd);
-			const todoTracker = await SqTodoTracker.create(trackingCwd, mode, toolCallId, params.runTitle);
-			const finalizeAndReturn = async (result: AgentToolResult<SubagentDetails>) => {
-				const withProgress = attachProgressSummary(result, progressTracker);
-				await todoTracker?.finalize(!result.isError, getResultSummaryText(withProgress));
-				return withTodoTrackingNote(withProgress, todoTracker?.statusNote());
-			};
-
-			try {
-				if (mode === "chain") {
-					const results: SingleResult[] = [];
-					let previousOutput = "";
-
-					for (let i = 0; i < params.steps.length; i++) {
-						const step = params.steps[i];
-						const taskKey = `chain:${i}`;
-						const previousTaskId = i > 0 ? todoTracker?.getTaskId(`chain:${i - 1}`) : undefined;
-						const invocation = resolveAgentInvocation(ctx.cwd, step.agent, resolveStepCwd(step, params, ctx.cwd));
-						const boundedPrevious = buildChainContext(previousOutput);
-						const taskWithContext = step.task.replace(/\{previous\}/g, boundedPrevious);
-
-						const agentName = getAgentDisplayName(step.agent);
-						await todoTracker?.startTask(
-							taskKey,
-							agentName,
-							taskWithContext,
-							invocation.taskCwd,
-							i + 1,
-							previousTaskId ? [previousTaskId] : [],
-						);
-						progressTracker.startTask(taskKey, agentName, taskWithContext, i + 1);
-						emitProgressUpdate({ content: [{ type: "text", text: "(running...)" }], details: makeDetails("chain")(results) });
-
-						const chainUpdate: OnUpdateCallback | undefined = onUpdate
-							? (partial) => {
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									emitProgressUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-							: undefined;
-
-						try {
-							const result = await runSingleAgent(
-								ctx.cwd,
-								invocation.discovery.agents,
-								step.agent,
-								taskWithContext,
-								step.thinking,
-								callerThinking,
-								ctx.model?.provider,
-								ctx.modelRegistry,
-								invocation.taskCwd,
-								i + 1,
-								signal,
-								chainUpdate,
-								makeDetails("chain"),
-							);
-							results.push(result);
-							await todoTracker?.finishTask(taskKey, result);
-							progressTracker.finishTask(taskKey, !(result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted"));
-							emitProgressUpdate({ content: [{ type: "text", text: getFinalOutput(result.messages) || "(step complete)" }], details: makeDetails("chain")(results) });
-
-							const isError =
-								result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-							if (isError) {
-								const errorMsg = getResultErrorText(result);
-								return await finalizeAndReturn({
-									content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${getAgentDisplayName(step.agent)}): ${errorMsg}` }],
-									details: makeDetails("chain")(results),
-									isError: true,
-								});
-							}
-
-							previousOutput = getFinalOutput(result.messages);
-						} catch (error) {
-							await todoTracker?.finishTaskWithError(taskKey, error);
-							progressTracker.finishTask(taskKey, false);
-							emitProgressUpdate({ content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: makeDetails("chain")(results) });
-							throw error;
-						}
-					}
-
-					return await finalizeAndReturn({
-						content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-						details: makeDetails("chain")(results),
-					});
-				}
-
-				if (mode === "parallel") {
-					if (params.steps.length > MAX_PARALLEL_TASKS) {
-						return await finalizeAndReturn({
-							content: [
-								{ type: "text", text: `Too many parallel tasks (${params.steps.length}). Max is ${MAX_PARALLEL_TASKS}.` },
-							],
-							details: makeDetails("parallel")([]),
-							isError: true,
-						});
-					}
-
-					const allResults: SingleResult[] = new Array(params.steps.length);
-					for (let i = 0; i < params.steps.length; i++) {
-						allResults[i] = {
-							agent: getAgentDisplayName(params.steps[i].agent),
-							agentSource: "unknown",
-							task: params.steps[i].task,
-							exitCode: -1,
-							messages: [],
-							stderr: "",
-							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-							thinkingLevel: resolveThinkingLevel(
-								params.steps[i].thinking,
-								isGenericAgentSpec(params.steps[i].agent) ? params.steps[i].agent.thinking : undefined,
-								callerThinking,
-							),
-						};
-					}
-
-					const emitParallelUpdate = (message = "(running...)") => {
-						emitProgressUpdate({
-							content: [{ type: "text", text: message }],
-							details: makeDetails("parallel")([...allResults]),
-						});
-					};
-
-					const results = await mapWithConcurrencyLimit(params.steps, MAX_CONCURRENCY, async (t, index) => {
-						const taskKey = `parallel:${index}`;
-						const agentName = getAgentDisplayName(t.agent);
-						const invocation = resolveAgentInvocation(ctx.cwd, t.agent, resolveStepCwd(t, params, ctx.cwd));
-						await todoTracker?.startTask(taskKey, agentName, t.task, invocation.taskCwd, undefined, []);
-						progressTracker.startTask(taskKey, agentName, t.task);
-						emitParallelUpdate();
-						try {
-							const result = await runSingleAgent(
-								ctx.cwd,
-								invocation.discovery.agents,
-								t.agent,
-								t.task,
-								t.thinking,
-								callerThinking,
-								ctx.model?.provider,
-								ctx.modelRegistry,
-								invocation.taskCwd,
-								undefined,
-								signal,
-								(partial) => {
-									if (partial.details?.results[0]) {
-										allResults[index] = partial.details.results[0];
-										emitParallelUpdate();
-									}
-								},
-								makeDetails("parallel"),
-							);
-							allResults[index] = result;
-							progressTracker.finishTask(taskKey, !(result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted"));
-							emitParallelUpdate(getFinalOutput(result.messages) || "(task complete)");
-							await todoTracker?.finishTask(taskKey, result);
-							return result;
-						} catch (error) {
-							await todoTracker?.finishTaskWithError(taskKey, error);
-							progressTracker.finishTask(taskKey, false);
-							emitParallelUpdate(error instanceof Error ? error.message : String(error));
-							throw error;
-						}
-					});
-
-					const failedResults = results.filter(
-						(r) => r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted",
-					);
-					const successCount = results.length - failedResults.length;
-					const failCount = failedResults.length;
-					const summaries = results.map((r) => {
-						const failed = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
-						const output = failed ? getResultErrorText(r) : getResultDisplayText(r);
-						const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
-						return `[${r.agent}] ${failed ? "failed" : "completed"}: ${preview || "(no output)"}`;
-					});
-
-					return await finalizeAndReturn({
-						content: [
-							{
-								type: "text",
-								text: `Parallel: ${successCount}/${results.length} succeeded${failCount > 0 ? `, ${failCount} failed` : ""}\n\n${summaries.join("\n\n")}`,
-							},
-						],
-						details: makeDetails("parallel")(results),
-						isError: failCount > 0,
-					});
-				}
-
-				if (mode === "single") {
-					const step = params.steps[0]!;
-					const agentName = getAgentDisplayName(step.agent);
-					const invocation = resolveAgentInvocation(ctx.cwd, step.agent, resolveStepCwd(step, params, ctx.cwd));
-					const taskKey = "single:0";
-					await todoTracker?.startTask(taskKey, agentName, step.task, invocation.taskCwd, undefined, []);
-					progressTracker.startTask(taskKey, agentName, step.task);
-					emitProgressUpdate({ content: [{ type: "text", text: "(running...)" }], details: makeDetails("single")([]) });
-					try {
-						const result = await runSingleAgent(
-							ctx.cwd,
-							invocation.discovery.agents,
-							step.agent,
-							step.task,
-							step.thinking,
-							callerThinking,
-							ctx.model?.provider,
-							ctx.modelRegistry,
-							invocation.taskCwd,
-							undefined,
-							signal,
-							emitProgressUpdate,
-							makeDetails("single"),
-						);
-
-						await todoTracker?.finishTask(taskKey, result);
-						progressTracker.finishTask(taskKey, !(result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted"));
-						const isError =
-							result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-						if (isError) {
-							const errorMsg = getResultErrorText(result);
-							return await finalizeAndReturn({
-								content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-								details: makeDetails("single")([result]),
-								isError: true,
-							});
-						}
-
-						return await finalizeAndReturn({
-							content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-							details: makeDetails("single")([result]),
-						});
-					} catch (error) {
-						await todoTracker?.finishTaskWithError(taskKey, error);
-						progressTracker.finishTask(taskKey, false);
-						emitProgressUpdate({ content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], details: makeDetails("single")([]) });
-						throw error;
-					}
-				}
-
-				return await finalizeAndReturn({
-					content: [{ type: "text", text: "Invalid parameters. Unsupported subagent mode." }],
-					details: makeDetails("single")([]),
-					isError: true,
-				});
-			} catch (error) {
-				const errorMessage = error instanceof Error ? error.message : String(error);
-				return await finalizeAndReturn({
-					content: [{ type: "text", text: `Subagent execution failed: ${errorMessage}` }],
-					details: makeDetails(mode)([]),
-					isError: true,
-				});
-			}
+			return await executeSubagentRequest(
+				toolCallId,
+				normalized.request,
+				ctx.cwd,
+				callerThinking,
+				undefined,
+				ctx.model?.provider,
+				ctx.modelRegistry,
+				signal,
+				onUpdate,
+			);
 		},
 
 		renderCall(args, theme) {
