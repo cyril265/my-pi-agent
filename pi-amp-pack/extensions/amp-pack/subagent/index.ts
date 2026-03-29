@@ -30,9 +30,6 @@ const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const MAX_CHAIN_PREVIOUS_CHARS = 12000;
 const AMP_SUBAGENT_PROCESS_ENV = "PI_AMP_SUBAGENT";
-const AMP_ROUTING_GUIDANCE_STATE = "amp-routing-guidance-state";
-
-const AMP_ROUTING_GUIDANCE = fs.readFileSync(new URL("./routing-guidance.md", import.meta.url), "utf-8").trim();
 
 type EffectiveThinkingLevel = Exclude<AgentThinkingLevel, "inherit">;
 const ThinkingLevelSchema = StringEnum(["low", "medium", "high", "xhigh", "inherit"] as const, {
@@ -802,18 +799,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		rememberModelContext(ctx as { model?: { provider: string; id: string }; modelRegistry: ModelRegistryLookup });
-		if (process.env[AMP_SUBAGENT_PROCESS_ENV] === "1") return;
-		const hasRoutingGuidanceState = ctx
-			.sessionManager
-			.getEntries()
-			.some((entry: { type: string; customType?: string }) => entry.type === "custom" && entry.customType === AMP_ROUTING_GUIDANCE_STATE);
-		if (hasRoutingGuidanceState) return;
-		pi.appendEntry(AMP_ROUTING_GUIDANCE_STATE, { injected: true });
-		pi.sendMessage({
-			customType: "amp-routing-guidance",
-			content: AMP_ROUTING_GUIDANCE,
-			display: false,
-		});
 	});
 
 	pi.on("model_select", async (event, ctx) => {

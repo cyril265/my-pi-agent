@@ -1,13 +1,13 @@
 # pi-amp-pack
 
-Amp-inspired subagents and workflow prompts for pi.
+Amp-inspired subagents, modes, and workflow prompts for pi.
 
 ## Includes
 
 - Subagent extension with thinking overrides, `inherit`, and provider-aware model selection
-- Injected routing guidance from extension context
+- Mode switching for `/smart`, `/deep`, and `/rush` on top of Pi's baseline system prompt
+- Prompt workflows like `/implement`, `/investigate`, `/review-changes`, and `/explain-code`
 - Auto-synced packaged agents into `~/.pi/agent/agents`
-- Workflow prompts like `/rush`, `/smart`, `/deep`
 
 ## Install
 
@@ -21,6 +21,12 @@ Then run:
 /reload
 ```
 
+## Commands
+
+- `/smart`, `/deep`, `/rush` set the active mode, adjust thinking level, and send your request unchanged
+- `smart` keeps Pi's baseline prompt; `deep` and `rush` append mode-specific guidance per turn
+- `/implement`, `/investigate`, `/review-changes`, and `/explain-code` inject packaged workflow prompts
+
 ## Agents
 
 This package ships a small set of bundled agents that are synced into `~/.pi/agent/agents`.
@@ -31,8 +37,6 @@ This package ships a small set of bundled agents that are synced into `~/.pi/age
 - `oracle` — stronger second-opinion agent for planning, reviews, difficult bugs, and technical trade-offs
 - `reviewer` — diff-focused code review agent for file-by-file change analysis
 - `code-tour` — guided walkthrough agent for explaining a diff in a useful reading order
-
-The bundled routing guidance also pushes usage toward the smallest sufficient workflow: work directly for small local tasks, use `search` for discovery, and delegate to specialist agents only when it materially helps.
 
 Bundled subagents prefer the active session's provider when that provider exposes the configured model ID, then fall back to the agent's explicit `fallbackModel`.
 

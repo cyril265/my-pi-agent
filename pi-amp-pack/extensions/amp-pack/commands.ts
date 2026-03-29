@@ -29,7 +29,20 @@ function buildWorkflowRequest(promptBody: string, request: string) {
   return `${promptBody}\n\nNow apply that workflow to this request:\n${request}`;
 }
 
-export default function registerWorkflowPresets(pi: ExtensionAPI) {
+function restoreMode(ctx: ExtensionContext) {
+  for (const entry of [...ctx.sessionManager.getEntries()].reverse()) {
+    if (entry.type === "custom" && entry.customType === WORKFLOW_MODE_ENTRY) {
+      const mode = entry.data?.mode;
+      if (typeof mode === "string" && mode.length > 0) {
+        return mode;
+      }
+      break;
+    }
+  }
+  return undefined;
+}
+
+export default function registerModeAndWorkflowCommands(pi: ExtensionAPI) {
   let activeWorkflowMode: string | undefined;
 
   function updateStatus(ctx: ExtensionContext) {
@@ -44,17 +57,39 @@ export default function registerWorkflowPresets(pi: ExtensionAPI) {
     pi.appendEntry(WORKFLOW_MODE_ENTRY, { mode });
   }
 
-  function restoreMode(ctx: ExtensionContext) {
-    for (const entry of [...ctx.sessionManager.getEntries()].reverse()) {
-      if (entry.type === "custom" && entry.customType === WORKFLOW_MODE_ENTRY) {
-        const mode = entry.data?.mode;
-        if (typeof mode === "string" && mode.length > 0) {
-          activeWorkflowMode = mode;
+  const registerModeCommand = (
+    name: string,
+    thinkingLevel: WorkflowThinkingLevel,
+    queuedLabel: string,
+    description: string,
+  ) => {
+
+    pi.registerCommand(name, {
+      description,
+      handler: async (args, ctx) => {
+        activeWorkflowMode = name;
+        persistMode(name);
+        updateStatus(ctx);
+        pi.setThinkingLevel(thinkingLevel);
+        const request = args?.trim();
+
+        if (!request) {
+          ctx.ui.notify(
+            `Mode set to ${name}. Thinking level set to ${thinkingLevel}. Usage: /${name} <request>`,
+            "info",
+          );
+          return;
         }
-        break;
-      }
-    }
-  }
+
+        if (ctx.isIdle()) {
+          pi.sendUserMessage(request);
+        } else {
+          pi.sendUserMessage(request, { deliverAs: "steer" });
+          ctx.ui.notify(`${queuedLabel} queued`, "info");
+        }
+      },
+    });
+  };
 
   const registerWorkflowCommand = (
     name: string,
@@ -67,9 +102,6 @@ export default function registerWorkflowPresets(pi: ExtensionAPI) {
     pi.registerCommand(name, {
       description,
       handler: async (args, ctx) => {
-        activeWorkflowMode = name;
-        persistMode(name);
-        updateStatus(ctx);
         pi.setThinkingLevel(thinkingLevel);
         const request = args?.trim();
 
@@ -92,23 +124,23 @@ export default function registerWorkflowPresets(pi: ExtensionAPI) {
     });
   };
 
-  registerWorkflowCommand(
+  registerModeCommand(
     "deep",
     "high",
     "Deep request",
-    "Set thinking to high and send the deep workflow prompt for a request",
+    "Set deep mode, raise thinking, and send the request unchanged",
   );
-  registerWorkflowCommand(
+  registerModeCommand(
     "rush",
     "low",
     "Rush request",
-    "Set thinking to low and send the rush workflow prompt for a request",
+    "Set rush mode, lower thinking, and send the request unchanged",
   );
-  registerWorkflowCommand(
+  registerModeCommand(
     "smart",
     "medium",
     "Smart request",
-    "Set thinking to medium and send the smart workflow prompt for a request",
+    "Set smart mode, keep the Pi baseline prompt, and send the request unchanged",
   );
   registerWorkflowCommand(
     "implement",
@@ -136,7 +168,7 @@ export default function registerWorkflowPresets(pi: ExtensionAPI) {
   );
 
   pi.on("session_start", async (_event, ctx) => {
-    restoreMode(ctx);
+    activeWorkflowMode = restoreMode(ctx);
     updateStatus(ctx);
   });
 }

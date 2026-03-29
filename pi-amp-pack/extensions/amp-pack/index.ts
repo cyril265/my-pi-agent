@@ -2,7 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import registerWorkflowPresets from "./presets";
+import registerModeAndWorkflowCommands from "./commands";
+import registerModeSystemPrompts from "./mode-system-prompts";
 import registerSubagentExtension from "./subagent/index";
 import registerSystemEvalExtension from "./system-eval";
 
@@ -78,7 +79,8 @@ function syncPackagedAgents() {
 export default function (pi: ExtensionAPI) {
   const syncResult = syncPackagedAgents();
 
-  registerWorkflowPresets(pi);
+  registerModeSystemPrompts(pi);
+  registerModeAndWorkflowCommands(pi);
   registerSystemEvalExtension(pi);
 
   pi.on("session_start", async (_event, ctx) => {
