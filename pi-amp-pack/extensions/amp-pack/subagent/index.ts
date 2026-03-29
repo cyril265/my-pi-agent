@@ -4,27 +4,26 @@
  * Spawns a separate `pi` process for each subagent invocation,
  * giving it an isolated context window.
  *
- * Preferred API:
- *   - { items: [{ agent, task }] } -> single mode
- *   - { items: [{ agent, task }, ...] } -> parallel mode
- *   - { mode: "chain", items: [{ agent, task: "... {previous} ..." }, ...] }
+ * Uses one caller-facing shape:
+ *   - Single: { steps: [{ agent: "name", task: "..." }] }
+ *   - Parallel: { steps: [{ agent: "name", task: "..." }, ...] }
+ *   - Chain: { sequential: true, steps: [{ agent: "name", task: "... {previous} ..." }, ...] }
  *
- * `agent` can be a saved agent name or an inline generic agent object.
  * Uses JSON mode to capture structured output from subagents.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { type ExtensionAPI, getMarkdownTheme, withFileMutationQueue } from "@mariozechner/pi-coding-agent";
+import { type ExtensionAPI, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { runPiJsonProcess, writePromptToTempFile } from "../pi-process";
 import { type AgentConfig, type AgentDiscoveryResult, type AgentThinkingLevel, discoverAgents } from "./agents.js";
-import { SqTodoTracker, extractSummaryLines, getResultSummaryText, type TodoTrackingOptions, withTodoTrackingNote } from "./todo-tracking.js";
+import { SqTodoTracker, extractSummaryLines, getResultSummaryText, withTodoTrackingNote } from "./todo-tracking.js";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -59,6 +58,63 @@ function resolveThinkingLevel(
 	return undefined;
 }
 
+interface ModelLookupResult {
+	provider: string;
+	id: string;
+}
+
+interface ModelRegistryLookup {
+	find(provider: string, modelId: string): ModelLookupResult | undefined;
+}
+
+type AgentSource = "user" | "project" | "inline" | "unknown";
+type AgentModelSource = "active-provider" | "fallback" | "pinned" | "configured";
+
+interface ResolvedAgentModel {
+	model?: string;
+	source?: AgentModelSource;
+}
+
+function resolveAgentModel(
+	agent: AgentConfig,
+	preferredProvider: string | undefined,
+	modelRegistry: ModelRegistryLookup,
+): ResolvedAgentModel {
+	const configuredModel = agent.model?.trim() || undefined;
+	const fallbackModel = agent.fallbackModel?.trim() || undefined;
+	if (!configuredModel) {
+		return fallbackModel ? { model: fallbackModel, source: "fallback" } : {};
+	}
+	if (configuredModel.includes("/")) return { model: configuredModel, source: "pinned" };
+	const preferredModel = preferredProvider ? modelRegistry.find(preferredProvider, configuredModel) : undefined;
+	if (preferredModel) {
+		return { model: `${preferredModel.provider}/${preferredModel.id}`, source: "active-provider" };
+	}
+	if (fallbackModel) return { model: fallbackModel, source: "fallback" };
+	return { model: configuredModel, source: "configured" };
+}
+
+function splitQualifiedModel(model: string | undefined): { provider?: string; id?: string } {
+	if (!model) return {};
+	const separatorIndex = model.indexOf("/");
+	if (separatorIndex === -1) return { id: model };
+	return {
+		provider: model.slice(0, separatorIndex),
+		id: model.slice(separatorIndex + 1),
+	};
+}
+
+function resolveRequestedModel(
+	model: string | undefined,
+	preferredProvider: string | undefined,
+	modelRegistry: ModelRegistryLookup | undefined,
+): string | undefined {
+	const configuredModel = model?.trim() || undefined;
+	if (!configuredModel || configuredModel.includes("/")) return configuredModel;
+	const preferredModel = preferredProvider && modelRegistry ? modelRegistry.find(preferredProvider, configuredModel) : undefined;
+	return preferredModel ? `${preferredModel.provider}/${preferredModel.id}` : configuredModel;
+}
+
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
@@ -66,19 +122,19 @@ function formatTokens(count: number): string {
 	return `${(count / 1000000).toFixed(1)}M`;
 }
 
-function formatUsageStats(
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens?: number;
-		turns?: number;
-	},
-	model?: string,
-	thinkingLevel?: EffectiveThinkingLevel,
-): string {
+type ThemeFormatter = {
+	fg: (color: any, text: string) => string;
+};
+
+function formatUsageStats(usage: {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+	contextTokens?: number;
+	turns?: number;
+}): string {
 	const parts: string[] = [];
 	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
 	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
@@ -89,9 +145,14 @@ function formatUsageStats(
 	if (usage.contextTokens && usage.contextTokens > 0) {
 		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
 	}
-	if (model) parts.push(model);
-	if (thinkingLevel) parts.push(`thinking:${thinkingLevel}`);
 	return parts.join(" ");
+}
+
+function formatResultMeta(result: Pick<SingleResult, "model" | "thinkingLevel">, theme: ThemeFormatter): string {
+	let text = "";
+	if (result.model) text += ` ${theme.fg("dim", `[${result.model}]`)}`;
+	if (result.thinkingLevel) text += ` ${theme.fg("warning", `[thinking:${result.thinkingLevel}]`)}`;
+	return text;
 }
 
 function formatToolCall(
@@ -412,34 +473,7 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	return results;
 }
 
-async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	});
-	return { dir: tmpDir, filePath };
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	if (currentScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-
-	return { command: "pi", args };
-}
-
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
-
-type AgentSource = "user" | "project" | "inline" | "unknown";
 
 interface GenericAgentSpec {
 	type?: "generic";
@@ -452,19 +486,6 @@ interface GenericAgentSpec {
 }
 
 type RequestedAgent = string | GenericAgentSpec;
-
-interface NormalizedTaskItem {
-	agent: RequestedAgent;
-	task: string;
-	thinking?: AgentThinkingLevel;
-	cwd?: string;
-}
-
-interface NormalizedSubagentRequest {
-	mode: "single" | "parallel" | "chain";
-	items: NormalizedTaskItem[];
-	todo?: TodoTrackingOptions;
-}
 
 interface ResolvedAgentConfig {
 	name: string;
@@ -487,43 +508,33 @@ function getAgentDisplayName(agent: RequestedAgent): string {
 function buildResolvedAgent(
 	agents: AgentConfig[],
 	requestedAgent: RequestedAgent,
+	preferredProvider: string | undefined,
+	modelRegistry: ModelRegistryLookup,
 ): { config?: ResolvedAgentConfig; unknownAgentName?: string } {
 	if (isGenericAgentSpec(requestedAgent)) {
 		return {
 			config: {
 				name: getAgentDisplayName(requestedAgent),
 				source: "inline",
-				tools: requestedAgent.tools,
-				model: requestedAgent.model,
+				tools: requestedAgent.tools?.length ? requestedAgent.tools : undefined,
+				model: resolveRequestedModel(requestedAgent.model, preferredProvider, modelRegistry),
 				thinking: requestedAgent.thinking,
 				systemPrompt: requestedAgent.systemPrompt,
 			},
 		};
 	}
 
-	const agent = agents.find((a) => a.name === requestedAgent);
-	if (!agent) {
-		return { unknownAgentName: requestedAgent };
-	}
-
+	const agent = agents.find((candidate) => candidate.name === requestedAgent);
+	if (!agent) return { unknownAgentName: requestedAgent };
 	return {
 		config: {
 			name: agent.name,
 			source: agent.source,
 			tools: agent.tools,
-			model: agent.model,
+			model: resolveAgentModel(agent, preferredProvider, modelRegistry).model,
 			thinking: agent.thinking,
 			systemPrompt: agent.systemPrompt,
 		},
-	};
-}
-
-function getRequestedAgentHeaderMeta(agents: AgentConfig[], requestedAgent: RequestedAgent): { name: string; model?: string; thinking?: AgentThinkingLevel } {
-	const resolved = buildResolvedAgent(agents, requestedAgent);
-	return {
-		name: resolved.config?.name ?? getAgentDisplayName(requestedAgent),
-		model: resolved.config?.model,
-		thinking: resolved.config?.thinking,
 	};
 }
 
@@ -534,24 +545,26 @@ async function runSingleAgent(
 	task: string,
 	thinkingOverride: AgentThinkingLevel | undefined,
 	callerThinking: string | undefined,
+	preferredProvider: string | undefined,
+	modelRegistry: ModelRegistryLookup,
 	cwd: string | undefined,
 	step: number | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
-	const resolved = buildResolvedAgent(agents, requestedAgent);
-	const displayName = getAgentDisplayName(requestedAgent);
+	const resolved = buildResolvedAgent(agents, requestedAgent, preferredProvider, modelRegistry);
+	const agentName = resolved.config?.name ?? getAgentDisplayName(requestedAgent);
 
 	if (!resolved.config) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
 		return {
-			agent: resolved.unknownAgentName ?? displayName,
+			agent: resolved.unknownAgentName ?? agentName,
 			agentSource: "unknown",
 			task,
 			exitCode: 1,
 			messages: [],
-			stderr: `Unknown agent: "${resolved.unknownAgentName ?? displayName}". Available agents: ${available}.`,
+			stderr: `Unknown agent: "${resolved.unknownAgentName ?? agentName}". Available agents: ${available}.`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 			step,
 		};
@@ -598,27 +611,13 @@ async function runSingleAgent(
 		}
 
 		args.push(`Task: ${task}`);
-		let wasAborted = false;
 
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				env: { ...process.env, [AMP_SUBAGENT_PROCESS_ENV]: "1" },
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-			let buffer = "";
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
+		const result = await runPiJsonProcess({
+			args,
+			cwd: cwd ?? defaultCwd,
+			env: { ...process.env, [AMP_SUBAGENT_PROCESS_ENV]: "1" },
+			signal,
+			onEvent: (event) => {
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message as Message;
 					currentResult.messages.push(msg);
@@ -645,44 +644,12 @@ async function runSingleAgent(
 					currentResult.messages.push(event.message as Message);
 					emitUpdate();
 				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", (error) => {
-				currentResult.errorMessage = error.message;
-				resolve(1);
-			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
+			},
 		});
 
-		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		currentResult.stderr = result.stderr;
+		currentResult.exitCode = result.exitCode;
+		if (result.aborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
 		if (tmpPromptPath)
@@ -713,85 +680,128 @@ const GenericAgentSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
-const AgentTargetSchema = Type.Union([
-	Type.String({ description: "Name of the saved agent to invoke" }),
-	GenericAgentSchema,
-]);
-
-function createDelegatedTaskSchema(taskDescription: string) {
-	return Type.Object({
-		agent: AgentTargetSchema,
-		task: Type.String({ description: taskDescription }),
-		thinking: Type.Optional(ThinkingLevelSchema),
-		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-	});
-}
-
-const TaskItem = createDelegatedTaskSchema("Task to delegate to the agent. In chain mode, supports {previous} placeholder for prior output.");
-
-const TodoOptionsSchema = Type.Object(
+const StepItem = Type.Object(
 	{
-		enabled: Type.Optional(
-			Type.Boolean({ description: "Enable or disable sq todo tracking for this subagent run. Default: true." }),
-		),
-		queuePath: Type.Optional(Type.String({ description: "Optional sq queue path override (issues.jsonl)." })),
-		runTitle: Type.Optional(Type.String({ description: "Optional sq run title for the parent tracking item." })),
+		agent: Type.Union([
+			Type.String({ description: "Name of the saved agent to invoke" }),
+			GenericAgentSchema,
+		]),
+		task: Type.String({
+			description: "Task to delegate to the agent. In sequential mode, {previous} can be used to inject the previous step output.",
+		}),
+		thinking: Type.Optional(ThinkingLevelSchema),
+		cwd: Type.Optional(Type.String({ description: "Working directory for this step" })),
 	},
 	{ additionalProperties: false },
 );
-
-const ExecutionModeSchema = StringEnum(["single", "parallel", "chain"] as const, {
-	description: "Execution mode. Defaults to single for one item and parallel for multiple items.",
-});
 
 const SubagentParams = Type.Object(
 	{
-		mode: Type.Optional(ExecutionModeSchema),
-		items: Type.Array(TaskItem, { minItems: 1, description: "List of delegated agent runs." }),
-		thinking: Type.Optional(ThinkingLevelSchema),
-		todo: Type.Optional(TodoOptionsSchema),
-		cwd: Type.Optional(Type.String({ description: "Default working directory for delegated agent processes" })),
+		steps: Type.Array(StepItem, {
+			minItems: 1,
+			description: "One step runs a single subagent; multiple steps run in parallel unless sequential:true.",
+		}),
+		sequential: Type.Optional(Type.Boolean({ description: "Run steps sequentially as a chain." })),
+		cwd: Type.Optional(Type.String({ description: "Default working directory for all steps unless a step overrides it." })),
+		runTitle: Type.Optional(Type.String({ description: "Optional tracking title for the parent subagent run." })),
 	},
 	{ additionalProperties: false },
 );
 
-function normalizeSubagentRequest(params: { mode?: "single" | "parallel" | "chain"; items: NormalizedTaskItem[]; todo?: TodoTrackingOptions; cwd?: string }): { request?: NormalizedSubagentRequest; error?: string } {
-	const items = params.items;
-	if (!Array.isArray(items) || items.length === 0) {
-		return { error: "No items provided. Add at least one entry to `items`." };
-	}
-
-	const mode = params.mode ?? (items.length === 1 ? "single" : "parallel");
-	if (mode === "single" && items.length !== 1) {
-		return { error: "Single mode requires exactly one item." };
-	}
-	if (mode !== "single" && items.length < 2) {
-		return { error: `${mode[0].toUpperCase()}${mode.slice(1)} mode requires at least two items.` };
-	}
-
-	return {
-		request: {
-			mode,
-			items: items.map((item) => ({ ...item, cwd: item.cwd ?? params.cwd })),
-			todo: params.todo,
-		},
-	};
+interface StepInput {
+	agent: RequestedAgent;
+	task: string;
+	thinking?: AgentThinkingLevel;
+	cwd?: string;
 }
 
-function resolveAvailableAgents(cwd: string, items: NormalizedTaskItem[]): AgentDiscoveryResult {
-	const discoveries = new Map<string, AgentConfig>();
-	let projectAgentsDir: string | null = null;
-	for (const item of items) {
-		const taskCwd = item.cwd ?? cwd;
-		const discovery = discoverAgents(taskCwd, "user");
-		projectAgentsDir ??= discovery.projectAgentsDir;
-		for (const agent of discovery.agents) discoveries.set(agent.name, agent);
-	}
-	return { agents: Array.from(discoveries.values()), projectAgentsDir };
+interface AgentInvocation {
+	taskCwd: string;
+	discovery: AgentDiscoveryResult;
+}
+
+function resolveInvocationCwd(defaultCwd: string, requestedCwd: string | undefined): string {
+	if (!requestedCwd) return defaultCwd;
+	return path.isAbsolute(requestedCwd) ? requestedCwd : path.resolve(defaultCwd, requestedCwd);
+}
+
+function resolveAgentInvocation(defaultCwd: string, _requestedAgent: RequestedAgent, requestedCwd: string | undefined): AgentInvocation {
+	const taskCwd = resolveInvocationCwd(defaultCwd, requestedCwd);
+	const discovery = discoverAgents(taskCwd, "user");
+	return { taskCwd, discovery };
+}
+
+function getSubagentMode(params: { steps: StepInput[]; sequential?: boolean }): "single" | "parallel" | "chain" {
+	if (params.sequential) return "chain";
+	return params.steps.length <= 1 ? "single" : "parallel";
+}
+
+function validateSubagentParams(params: { steps: StepInput[]; sequential?: boolean }): string | undefined {
+	if (params.steps.length === 0) return "At least one step is required.";
+	if (params.sequential && params.steps.length < 2) return "Sequential mode requires at least 2 steps.";
+	return undefined;
+}
+
+function resolveStepCwd(step: StepInput, params: { cwd?: string }, sessionCwd: string): string {
+	return resolveInvocationCwd(sessionCwd, step.cwd ?? params.cwd);
+}
+
+function resolveTrackingCwd(params: { steps: StepInput[]; cwd?: string }, sessionCwd: string): string {
+	if (params.cwd) return resolveInvocationCwd(sessionCwd, params.cwd);
+	const resolvedStepCwds = [...new Set(params.steps.map((step) => resolveStepCwd(step, params, sessionCwd)))];
+	return resolvedStepCwds.length === 1 ? resolvedStepCwds[0]! : sessionCwd;
 }
 
 export default function (pi: ExtensionAPI) {
+	let currentModel: { provider: string; id: string } | undefined;
+	let currentModelRegistry: ModelRegistryLookup | undefined;
+
+	const rememberModelContext = (ctx: { model?: { provider: string; id: string }; modelRegistry: ModelRegistryLookup }) => {
+		currentModel = ctx.model;
+		currentModelRegistry = ctx.modelRegistry;
+	};
+
+	const findAgentForPreview = (agentName: string) => discoverAgents(process.cwd(), "user").agents.find((agent) => agent.name === agentName);
+
+	const formatPreviewSettings = (
+		requestedAgent: RequestedAgent | undefined,
+		thinkingOverride: AgentThinkingLevel | undefined,
+		theme: ThemeFormatter,
+	): string => {
+		if (!requestedAgent) return "";
+
+		const resolved = typeof requestedAgent === "string"
+			? (() => {
+				const agent = findAgentForPreview(requestedAgent);
+				if (!agent) return undefined;
+				return {
+					model: currentModelRegistry
+						? resolveAgentModel(agent, currentModel?.provider, currentModelRegistry).model
+						: agent.model?.trim() || agent.fallbackModel?.trim() || undefined,
+					thinking: agent.thinking,
+				};
+			})()
+			: {
+				model: resolveRequestedModel(requestedAgent.model, currentModel?.provider, currentModelRegistry),
+				thinking: requestedAgent.thinking,
+			};
+		if (!resolved) return "";
+
+		const resolvedModel = resolved.model?.trim() || undefined;
+		const resolvedParts = splitQualifiedModel(resolvedModel);
+		const providerText = resolvedParts.provider
+			? currentModel?.provider === resolvedParts.provider ? "inherit" : resolvedParts.provider
+			: "inherit";
+		const modelText = resolvedParts.id
+			? currentModel?.id === resolvedParts.id ? "inherit" : resolvedParts.id
+			: "inherit";
+		const requestedThinking = thinkingOverride ?? resolved.thinking;
+		const thinkingText = !requestedThinking || requestedThinking === "inherit" ? "inherit" : requestedThinking;
+		return ` ${theme.fg("dim", `[provider:${providerText}, model:${modelText}, thinking:${thinkingText}]`)}`;
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
+		rememberModelContext(ctx as { model?: { provider: string; id: string }; modelRegistry: ModelRegistryLookup });
 		if (process.env[AMP_SUBAGENT_PROCESS_ENV] === "1") return;
 		const hasRoutingGuidanceState = ctx
 			.sessionManager
@@ -806,22 +816,31 @@ export default function (pi: ExtensionAPI) {
 		});
 	});
 
+	pi.on("model_select", async (event, ctx) => {
+		rememberModelContext({ model: event.model as { provider: string; id: string }, modelRegistry: ctx.modelRegistry as ModelRegistryLookup });
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
-			"API: { mode?, items:[{ agent, task, thinking?, cwd? }] } with mode defaulting to single for one item and parallel for multiple items.",
-			"Chain mode runs sequentially and supports {previous} placeholders.",
-			"agent can be a saved agent name or an inline generic agent object with systemPrompt, tools, model, and thinking.",
-			'Use thinking: "inherit" to use the caller\'s current thinking level.',
-			"Todo tracking is enabled by default; set todo.enabled:false to disable tracking for a call.",
+			"Pass `steps` as an array: one step runs a single subagent, multiple steps run in parallel.",
+			"Set `sequential:true` to run steps as a chain with optional {previous} placeholders.",
+			"Each step agent can be a saved agent name or an inline generic agent object with systemPrompt, tools, model, and thinking.",
+			"Thinking is configured per step; use thinking: \"inherit\" to use the caller's current thinking level.",
+			"Uses user agents from ~/.pi/agent/agents.",
+			"Todo tracking is always attempted in the nearest .sift/issues.jsonl queue for the invocation.",
 		].join(" "),
 		parameters: SubagentParams,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			rememberModelContext(ctx as { model?: { provider: string; id: string }; modelRegistry: ModelRegistryLookup });
+			const baseDiscovery = discoverAgents(ctx.cwd, "user");
 			const callerThinking = pi.getThinkingLevel();
-			const normalized = normalizeSubagentRequest(params);
+			const validationError = validateSubagentParams(params);
+
+			const mode = getSubagentMode(params);
 			const makeDetails =
 				(detailsMode: "single" | "parallel" | "chain") =>
 				(results: SingleResult[]): SubagentDetails => ({
@@ -829,28 +848,26 @@ export default function (pi: ExtensionAPI) {
 					results,
 				});
 
-			if (!normalized.request) {
-				const baseDiscovery = discoverAgents(ctx.cwd, "user");
+			if (validationError) {
 				const available = baseDiscovery.agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
-					content: [{ type: "text", text: `${normalized.error ?? "Invalid parameters."}\nAvailable agents: ${available}` }],
+					content: [{ type: "text", text: `Invalid parameters. ${validationError}\nAvailable agents: ${available}` }],
 					details: makeDetails("single")([]),
 				};
 			}
 
-			const request = normalized.request;
-			const availableAgents = resolveAvailableAgents(ctx.cwd, request.items);
-			const plannedTasks = request.items.map((item, index) => ({
-				key: `${request.mode === "chain" ? "chain" : request.mode === "parallel" ? "parallel" : "single"}:${index}`,
-				agent: getAgentDisplayName(item.agent),
-				task: item.task,
-				step: request.mode === "chain" ? index + 1 : undefined,
+			const plannedTasks = params.steps.map((step, index) => ({
+				key: `${mode}:${index}`,
+				agent: getAgentDisplayName(step.agent),
+				task: step.task,
+				step: mode === "chain" ? index + 1 : undefined,
 			}));
-			const progressTracker = new RunProgressTracker(request.mode, plannedTasks);
+			const progressTracker = new RunProgressTracker(mode, plannedTasks);
 			const emitProgressUpdate = (partial: AgentToolResult<SubagentDetails>) => onUpdate?.(attachProgressSummary(partial, progressTracker));
-			emitProgressUpdate({ content: [{ type: "text", text: "(starting...)" }], details: makeDetails(request.mode)([]) });
+			emitProgressUpdate({ content: [{ type: "text", text: "(starting...)" }], details: makeDetails(mode)([]) });
 
-			const todoTracker = await SqTodoTracker.create(ctx.cwd, request.mode, toolCallId, request.todo ?? {});
+			const trackingCwd = resolveTrackingCwd(params, ctx.cwd);
+			const todoTracker = await SqTodoTracker.create(trackingCwd, mode, toolCallId, params.runTitle);
 			const finalizeAndReturn = async (result: AgentToolResult<SubagentDetails>) => {
 				const withProgress = attachProgressSummary(result, progressTracker);
 				await todoTracker?.finalize(!result.isError, getResultSummaryText(withProgress));
@@ -858,20 +875,27 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			try {
-				if (request.mode === "chain") {
+				if (mode === "chain") {
 					const results: SingleResult[] = [];
 					let previousOutput = "";
 
-					for (let i = 0; i < request.items.length; i++) {
-						const step = request.items[i];
+					for (let i = 0; i < params.steps.length; i++) {
+						const step = params.steps[i];
 						const taskKey = `chain:${i}`;
 						const previousTaskId = i > 0 ? todoTracker?.getTaskId(`chain:${i - 1}`) : undefined;
-						const taskCwd = step.cwd ?? ctx.cwd;
+						const invocation = resolveAgentInvocation(ctx.cwd, step.agent, resolveStepCwd(step, params, ctx.cwd));
 						const boundedPrevious = buildChainContext(previousOutput);
 						const taskWithContext = step.task.replace(/\{previous\}/g, boundedPrevious);
-						const agentName = getAgentDisplayName(step.agent);
 
-						await todoTracker?.startTask(taskKey, agentName, taskWithContext, taskCwd, i + 1, previousTaskId ? [previousTaskId] : []);
+						const agentName = getAgentDisplayName(step.agent);
+						await todoTracker?.startTask(
+							taskKey,
+							agentName,
+							taskWithContext,
+							invocation.taskCwd,
+							i + 1,
+							previousTaskId ? [previousTaskId] : [],
+						);
 						progressTracker.startTask(taskKey, agentName, taskWithContext, i + 1);
 						emitProgressUpdate({ content: [{ type: "text", text: "(running...)" }], details: makeDetails("chain")(results) });
 
@@ -891,12 +915,14 @@ export default function (pi: ExtensionAPI) {
 						try {
 							const result = await runSingleAgent(
 								ctx.cwd,
-								availableAgents.agents,
+								invocation.discovery.agents,
 								step.agent,
 								taskWithContext,
-								step.thinking ?? params.thinking,
+								step.thinking,
 								callerThinking,
-								taskCwd,
+								ctx.model?.provider,
+								ctx.modelRegistry,
+								invocation.taskCwd,
 								i + 1,
 								signal,
 								chainUpdate,
@@ -912,7 +938,7 @@ export default function (pi: ExtensionAPI) {
 							if (isError) {
 								const errorMsg = getResultErrorText(result);
 								return await finalizeAndReturn({
-									content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${agentName}): ${errorMsg}` }],
+									content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${getAgentDisplayName(step.agent)}): ${errorMsg}` }],
 									details: makeDetails("chain")(results),
 									isError: true,
 								});
@@ -933,28 +959,32 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				if (request.mode === "parallel") {
-					if (request.items.length > MAX_PARALLEL_TASKS) {
+				if (mode === "parallel") {
+					if (params.steps.length > MAX_PARALLEL_TASKS) {
 						return await finalizeAndReturn({
 							content: [
-								{ type: "text", text: `Too many parallel tasks (${request.items.length}). Max is ${MAX_PARALLEL_TASKS}.` },
+								{ type: "text", text: `Too many parallel tasks (${params.steps.length}). Max is ${MAX_PARALLEL_TASKS}.` },
 							],
 							details: makeDetails("parallel")([]),
 							isError: true,
 						});
 					}
 
-					const allResults: SingleResult[] = new Array(request.items.length);
-					for (let i = 0; i < request.items.length; i++) {
+					const allResults: SingleResult[] = new Array(params.steps.length);
+					for (let i = 0; i < params.steps.length; i++) {
 						allResults[i] = {
-							agent: getAgentDisplayName(request.items[i].agent),
+							agent: getAgentDisplayName(params.steps[i].agent),
 							agentSource: "unknown",
-							task: request.items[i].task,
+							task: params.steps[i].task,
 							exitCode: -1,
 							messages: [],
 							stderr: "",
 							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-							thinkingLevel: resolveThinkingLevel(request.items[i].thinking ?? params.thinking, isGenericAgentSpec(request.items[i].agent) ? request.items[i].agent.thinking : undefined, callerThinking),
+							thinkingLevel: resolveThinkingLevel(
+								params.steps[i].thinking,
+								isGenericAgentSpec(params.steps[i].agent) ? params.steps[i].agent.thinking : undefined,
+								callerThinking,
+							),
 						};
 					}
 
@@ -965,22 +995,24 @@ export default function (pi: ExtensionAPI) {
 						});
 					};
 
-					const results = await mapWithConcurrencyLimit(request.items, MAX_CONCURRENCY, async (t, index) => {
+					const results = await mapWithConcurrencyLimit(params.steps, MAX_CONCURRENCY, async (t, index) => {
 						const taskKey = `parallel:${index}`;
-						const taskCwd = t.cwd ?? ctx.cwd;
 						const agentName = getAgentDisplayName(t.agent);
-						await todoTracker?.startTask(taskKey, agentName, t.task, taskCwd, undefined, []);
+						const invocation = resolveAgentInvocation(ctx.cwd, t.agent, resolveStepCwd(t, params, ctx.cwd));
+						await todoTracker?.startTask(taskKey, agentName, t.task, invocation.taskCwd, undefined, []);
 						progressTracker.startTask(taskKey, agentName, t.task);
 						emitParallelUpdate();
 						try {
 							const result = await runSingleAgent(
 								ctx.cwd,
-								availableAgents.agents,
+								invocation.discovery.agents,
 								t.agent,
 								t.task,
-								t.thinking ?? params.thinking,
+								t.thinking,
 								callerThinking,
-								taskCwd,
+								ctx.model?.provider,
+								ctx.modelRegistry,
+								invocation.taskCwd,
 								undefined,
 								signal,
 								(partial) => {
@@ -1028,23 +1060,25 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				if (request.mode === "single") {
-					const singleItem = request.items[0];
+				if (mode === "single") {
+					const step = params.steps[0]!;
+					const agentName = getAgentDisplayName(step.agent);
+					const invocation = resolveAgentInvocation(ctx.cwd, step.agent, resolveStepCwd(step, params, ctx.cwd));
 					const taskKey = "single:0";
-					const taskCwd = singleItem.cwd ?? ctx.cwd;
-					const agentName = getAgentDisplayName(singleItem.agent);
-					await todoTracker?.startTask(taskKey, agentName, singleItem.task, taskCwd, undefined, []);
-					progressTracker.startTask(taskKey, agentName, singleItem.task);
+					await todoTracker?.startTask(taskKey, agentName, step.task, invocation.taskCwd, undefined, []);
+					progressTracker.startTask(taskKey, agentName, step.task);
 					emitProgressUpdate({ content: [{ type: "text", text: "(running...)" }], details: makeDetails("single")([]) });
 					try {
 						const result = await runSingleAgent(
 							ctx.cwd,
-							availableAgents.agents,
-							singleItem.agent,
-							singleItem.task,
-							singleItem.thinking ?? params.thinking,
+							invocation.discovery.agents,
+							step.agent,
+							step.task,
+							step.thinking,
 							callerThinking,
-							taskCwd,
+							ctx.model?.provider,
+							ctx.modelRegistry,
+							invocation.taskCwd,
 							undefined,
 							signal,
 							emitProgressUpdate,
@@ -1077,7 +1111,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				return await finalizeAndReturn({
-					content: [{ type: "text", text: "Invalid parameters." }],
+					content: [{ type: "text", text: "Invalid parameters. Unsupported subagent mode." }],
 					details: makeDetails("single")([]),
 					isError: true,
 				});
@@ -1085,61 +1119,66 @@ export default function (pi: ExtensionAPI) {
 				const errorMessage = error instanceof Error ? error.message : String(error);
 				return await finalizeAndReturn({
 					content: [{ type: "text", text: `Subagent execution failed: ${errorMessage}` }],
-					details: makeDetails(request.mode)([]),
+					details: makeDetails(mode)([]),
 					isError: true,
 				});
 			}
 		},
 
 		renderCall(args, theme) {
-			const metaText = (model?: string, thinking?: AgentThinkingLevel | "mixed") => {
-				const parts: string[] = [];
-				if (model) parts.push(theme.fg("accent", `[model:${model}]`));
-				if (thinking) parts.push(theme.fg("warning", `[thinking:${thinking}]`));
-				return parts.length > 0 ? ` ${parts.join(" ")}` : "";
-			};
-			const summarizeValues = <T,>(values: Array<T | undefined>): T | "mixed" | undefined => {
-				const defined = values.filter((value): value is T => value !== undefined);
-				if (defined.length === 0) return undefined;
-				return defined.every((value) => value === defined[0]) ? defined[0] : "mixed";
-			};
-			const normalized = normalizeSubagentRequest(args);
-			if (!normalized.request) {
-				return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("error", normalized.error ?? "invalid"), 0, 0);
-			}
-			const request = normalized.request;
-			const discoveredAgents = resolveAvailableAgents(process.cwd(), request.items).agents;
-			const itemMetas = request.items.map((item) => {
-				const agentMeta = getRequestedAgentHeaderMeta(discoveredAgents, item.agent);
-				return {
-					...agentMeta,
-					thinking: (item.thinking ?? agentMeta.thinking ?? args.thinking) as AgentThinkingLevel | undefined,
-				};
-			});
-			const title = request.mode === "chain"
-				? `chain (${request.items.length} steps)`
-				: request.mode === "parallel"
-					? `parallel (${request.items.length} tasks)`
-					: itemMetas[0]?.name ?? getAgentDisplayName(request.items[0]?.agent ?? "...");
-			const topMeta = request.mode === "single"
-				? { model: itemMetas[0]?.model, thinking: itemMetas[0]?.thinking }
-				: {
-					model: summarizeValues(itemMetas.map((meta) => meta.model)),
-					thinking: summarizeValues(itemMetas.map((meta) => meta.thinking)),
-				};
-			let text = theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", title) + metaText(topMeta.model, topMeta.thinking);
-			for (let i = 0; i < Math.min(request.items.length, request.mode === "single" ? 1 : 3); i++) {
-				const item = request.items[i];
-				const cleanTask = request.mode === "chain" ? item.task.replace(/\{previous\}/g, "").trim() : item.task;
-				const preview = wrapTaskPreview(cleanTask, request.mode === "single" ? 108 : 72, request.mode === "single" ? 4 : 3);
-				const itemMeta = itemMetas[i];
-				if (request.mode === "single") {
-					text += `\n  ${theme.fg("dim", preview)}`;
-					continue;
+			const settingsText = (agent: RequestedAgent | undefined, thinking?: AgentThinkingLevel) =>
+				formatPreviewSettings(agent, thinking, theme);
+			const steps = Array.isArray(args.steps) ? args.steps : [];
+			const mode = getSubagentMode({ steps, sequential: args.sequential });
+			if (mode === "chain") {
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", `chain (${steps.length} steps)`);
+				for (let i = 0; i < Math.min(steps.length, 3); i++) {
+					const step = steps[i];
+					const agent = step?.agent as RequestedAgent | undefined;
+					const agentName = agent ? getAgentDisplayName(agent) : "...";
+					const taskText = typeof step?.task === "string" ? step.task : "";
+					const thinking = typeof step?.thinking === "string" ? step.thinking : undefined;
+					const cleanTask = taskText.replace(/\{previous\}/g, "").trim();
+					const preview = wrapTaskPreview(cleanTask);
+					text +=
+						"\n  " +
+						theme.fg("muted", `${i + 1}.`) +
+						" " +
+						theme.fg("accent", agentName) +
+						settingsText(agent, thinking) +
+						theme.fg("dim", ` ${preview}`);
 				}
-				text += `\n  ${request.mode === "chain" ? `${theme.fg("muted", `${i + 1}.`)} ` : ""}${theme.fg("accent", itemMeta.name)}${metaText(itemMeta.model, itemMeta.thinking)}${theme.fg("dim", ` ${preview}`)}`;
+				if (steps.length > 3) text += `\n  ${theme.fg("muted", `... +${steps.length - 3} more`)}`;
+				return new Text(text, 0, 0);
 			}
-			if (request.mode !== "single" && request.items.length > 3) text += `\n  ${theme.fg("muted", `... +${request.items.length - 3} more`)}`;
+			if (mode === "parallel") {
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", `parallel (${steps.length} tasks)`);
+				for (const step of steps.slice(0, 3)) {
+					const agent = step?.agent as RequestedAgent | undefined;
+					const agentName = agent ? getAgentDisplayName(agent) : "...";
+					const taskText = typeof step?.task === "string" ? step.task : "";
+					const thinking = typeof step?.thinking === "string" ? step.thinking : undefined;
+					const preview = wrapTaskPreview(taskText);
+					text += `\n  ${theme.fg("accent", agentName)}${settingsText(agent, thinking)}${theme.fg("dim", ` ${preview}`)}`;
+				}
+				if (steps.length > 3) text += `\n  ${theme.fg("muted", `... +${steps.length - 3} more`)}`;
+				return new Text(text, 0, 0);
+			}
+			const step = steps[0];
+			const agent = step?.agent as RequestedAgent | undefined;
+			const agentName = agent ? getAgentDisplayName(agent) : "...";
+			const taskText = typeof step?.task === "string" ? step.task : "";
+			const thinking = typeof step?.thinking === "string" ? step.thinking : undefined;
+			const preview = wrapTaskPreview(taskText, 108, 4);
+			let text =
+				theme.fg("toolTitle", theme.bold("subagent ")) +
+				theme.fg("accent", agentName) +
+				settingsText(agent, thinking);
+			text += `\n  ${theme.fg("dim", preview)}`;
 			return new Text(text, 0, 0);
 		},
 
@@ -1187,15 +1226,6 @@ export default function (pi: ExtensionAPI) {
 				if (summaryLines.todo) parts.push(theme.fg("muted", summaryLines.todo));
 				return parts.length > 0 ? `${parts.join("\n")}\n\n` : "";
 			};
-			const summarizeValues = <T,>(values: Array<T | undefined>): T | "mixed" | undefined => {
-				const defined = values.filter((value): value is T => value !== undefined);
-				if (defined.length === 0) return undefined;
-				return defined.every((value) => value === defined[0]) ? defined[0] : "mixed";
-			};
-			const sharedResultMeta = (results: SingleResult[]) => ({
-				model: summarizeValues(results.map((r) => r.model)),
-				thinking: summarizeValues(results.map((r) => r.thinkingLevel)),
-			});
 
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
@@ -1208,9 +1238,7 @@ export default function (pi: ExtensionAPI) {
 				if (expanded) {
 					const container = new Container();
 					appendSummaryHeader(container);
-					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-					if (r.model) header += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
-					if (r.thinkingLevel) header += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
+					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}${formatResultMeta(r, theme)}`;
 					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					container.addChild(new Text(header, 0, 0));
 					if (isError && errorText)
@@ -1238,7 +1266,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 					}
-					const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
+					const usageStr = formatUsageStats(r.usage);
 					if (usageStr) {
 						container.addChild(new Spacer(1));
 						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
@@ -1246,9 +1274,7 @@ export default function (pi: ExtensionAPI) {
 					return container;
 				}
 
-				let text = `${buildSummaryPrefix()}${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-				if (r.model) text += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
-				if (r.thinkingLevel) text += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
+				let text = `${buildSummaryPrefix()}${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}${formatResultMeta(r, theme)}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				if (isError && errorText) text += `\n${theme.fg("error", `Error: ${errorText}`)}`;
 				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
@@ -1256,7 +1282,7 @@ export default function (pi: ExtensionAPI) {
 					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
 					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				}
-				const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
+				const usageStr = formatUsageStats(r.usage);
 				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
 				return new Text(text, 0, 0);
 			}
@@ -1277,19 +1303,20 @@ export default function (pi: ExtensionAPI) {
 			if (details.mode === "chain") {
 				const successCount = details.results.filter((r) => r.exitCode === 0).length;
 				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
-				const topMeta = sharedResultMeta(details.results);
 
 				if (expanded) {
 					const container = new Container();
 					appendSummaryHeader(container);
-					let chainHeader =
-						icon +
-						" " +
-						theme.fg("toolTitle", theme.bold("chain ")) +
-						theme.fg("accent", `${successCount}/${details.results.length} steps`);
-					if (topMeta.model) chainHeader += ` ${theme.fg("accent", `[model:${topMeta.model}]`)}`;
-					if (topMeta.thinking) chainHeader += ` ${theme.fg("warning", `[thinking:${topMeta.thinking}]`)}`;
-					container.addChild(new Text(chainHeader, 0, 0));
+					container.addChild(
+						new Text(
+							icon +
+								" " +
+								theme.fg("toolTitle", theme.bold("chain ")) +
+								theme.fg("accent", `${successCount}/${details.results.length} steps`),
+							0,
+							0,
+						),
+					);
 
 					for (const r of details.results) {
 						const rIsError = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
@@ -1299,9 +1326,7 @@ export default function (pi: ExtensionAPI) {
 						const errorText = rIsError ? getResultErrorText(r) : "";
 
 						container.addChild(new Spacer(1));
-						let stepHeader = `${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}`;
-						if (r.model) stepHeader += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
-						if (r.thinkingLevel) stepHeader += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
+						const stepHeader = `${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
 						container.addChild(new Text(stepHeader, 0, 0));
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 						if (rIsError && errorText) container.addChild(new Text(theme.fg("error", `Error: ${errorText}`), 0, 0));
@@ -1326,7 +1351,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Text(theme.fg("error", errorText), 0, 0));
 						}
 
-						const stepUsage = formatUsageStats(r.usage, r.model, r.thinkingLevel);
+						const stepUsage = formatUsageStats(r.usage);
 						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
 					}
 
@@ -1344,16 +1369,12 @@ export default function (pi: ExtensionAPI) {
 					" " +
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
-				if (topMeta.model) text += ` ${theme.fg("accent", `[model:${topMeta.model}]`)}`;
-				if (topMeta.thinking) text += ` ${theme.fg("warning", `[thinking:${topMeta.thinking}]`)}`;
 				for (const r of details.results) {
 					const rIsError = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
 					const rIcon = rIsError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
 					const errorText = rIsError ? getResultErrorText(r) : "";
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (r.model) text += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
-					if (r.thinkingLevel) text += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
+					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
 					if (rIsError && errorText) text += `\n${theme.fg("error", `Error: ${errorText}`)}`;
 					else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
@@ -1370,7 +1391,6 @@ export default function (pi: ExtensionAPI) {
 				const running = details.results.filter((r) => r.exitCode === -1).length;
 				const failCount = details.results.filter(isFailedResult).length;
 				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-				const topMeta = sharedResultMeta(details.results);
 				const isRunning = running > 0;
 				const icon = isRunning
 					? theme.fg("warning", "⏳")
@@ -1384,10 +1404,13 @@ export default function (pi: ExtensionAPI) {
 				if (expanded && !isRunning) {
 					const container = new Container();
 					appendSummaryHeader(container);
-					let parallelHeader = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
-					if (topMeta.model) parallelHeader += ` ${theme.fg("accent", `[model:${topMeta.model}]`)}`;
-					if (topMeta.thinking) parallelHeader += ` ${theme.fg("warning", `[thinking:${topMeta.thinking}]`)}`;
-					container.addChild(new Text(parallelHeader, 0, 0));
+					container.addChild(
+						new Text(
+							`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
+							0,
+							0,
+						),
+					);
 
 					for (const r of details.results) {
 						const rIsError = isFailedResult(r);
@@ -1397,9 +1420,7 @@ export default function (pi: ExtensionAPI) {
 						const errorText = rIsError ? getResultErrorText(r) : "";
 
 						container.addChild(new Spacer(1));
-						let taskHeader = `${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`;
-						if (r.model) taskHeader += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
-						if (r.thinkingLevel) taskHeader += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
+						const taskHeader = `${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
 						container.addChild(new Text(taskHeader, 0, 0));
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 						if (rIsError && errorText) container.addChild(new Text(theme.fg("error", `Error: ${errorText}`), 0, 0));
@@ -1424,7 +1445,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Text(theme.fg("error", errorText), 0, 0));
 						}
 
-						const taskUsage = formatUsageStats(r.usage, r.model, r.thinkingLevel);
+						const taskUsage = formatUsageStats(r.usage);
 						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
 					}
 
@@ -1437,8 +1458,6 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				let text = `${buildSummaryPrefix()}${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
-				if (topMeta.model) text += ` ${theme.fg("accent", `[model:${topMeta.model}]`)}`;
-				if (topMeta.thinking) text += ` ${theme.fg("warning", `[thinking:${topMeta.thinking}]`)}`;
 				for (const r of details.results) {
 					const rIsError = isFailedResult(r);
 					const rIcon =
@@ -1449,9 +1468,7 @@ export default function (pi: ExtensionAPI) {
 								: theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
 					const errorText = rIsError ? getResultErrorText(r) : "";
-					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
-					if (r.model) text += ` ${theme.fg("accent", `[model:${r.model}]`)}`;
-					if (r.thinkingLevel) text += ` ${theme.fg("warning", `[thinking:${r.thinkingLevel}]`)}`;
+					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
 					if (rIsError && errorText) text += `\n${theme.fg("error", `Error: ${errorText}`)}`;
 					else if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;

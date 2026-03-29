@@ -14,6 +14,7 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	fallbackModel?: string;
 	thinking?: AgentThinkingLevel;
 	systemPrompt: string;
 	source: "user" | "project";
@@ -65,13 +66,16 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			?.split(",")
 			.map((t: string) => t.trim())
 			.filter(Boolean);
+		const model = frontmatter.model?.trim() || undefined;
+		const fallbackModel = frontmatter.fallbackModel?.trim() || undefined;
 		const thinking = frontmatter.thinking?.trim();
 
 		agents.push({
 			name: frontmatter.name,
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model,
+			model,
+			fallbackModel,
 			thinking: isThinkingLevel(thinking) ? thinking : undefined,
 			systemPrompt: body,
 			source,

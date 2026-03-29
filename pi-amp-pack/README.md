@@ -4,7 +4,7 @@ Amp-inspired subagents and workflow prompts for pi.
 
 ## Includes
 
-- Subagent extension with thinking overrides and `inherit`
+- Subagent extension with thinking overrides, `inherit`, and provider-aware model selection
 - Injected routing guidance from extension context
 - Auto-synced packaged agents into `~/.pi/agent/agents`
 - Workflow prompts like `/rush`, `/smart`, `/deep`
@@ -34,50 +34,23 @@ This package ships a small set of bundled agents that are synced into `~/.pi/age
 
 The bundled routing guidance also pushes usage toward the smallest sufficient workflow: work directly for small local tasks, use `search` for discovery, and delegate to specialist agents only when it materially helps.
 
-## Subagent API
+Bundled subagents prefer the active session's provider when that provider exposes the configured model ID, then fall back to the agent's explicit `fallbackModel`.
 
-Preferred shape:
+## Subagent Shape
 
-```ts
-{
-  mode?: "single" | "parallel" | "chain",
-  items: [
-    {
-      agent: "coder" | {
-        type?: "generic",
-        name?: string,
-        systemPrompt: string,
-        tools?: string[],
-        model?: string,
-        thinking?: "low" | "medium" | "high" | "xhigh" | "inherit"
-      },
-      task: string,
-      thinking?: "low" | "medium" | "high" | "xhigh" | "inherit",
-      cwd?: string
-    }
-  ],
-  thinking?: "low" | "medium" | "high" | "xhigh" | "inherit",
-  todo?: { enabled?: boolean, queuePath?: string, runTitle?: string },
-  cwd?: string
-}
-```
+The `subagent` tool accepts:
 
-Notes:
-- `mode` defaults to `single` for one item and `parallel` for multiple items
-- `single` mode requires exactly one item
-- `parallel` and `chain` mode require at least two items
-- `chain` mode runs sequentially and replaces `{previous}` in later tasks
-- `agent` can be a saved agent name or an inline generic agent configured entirely by the caller
+- `steps`: array of `{ agent, task, thinking?, cwd? }`
+- `agent`: either a saved agent name or an inline generic agent object with `systemPrompt` and optional `tools`, `model`, `thinking`, and `name`
+- `sequential`: optional boolean to run 2+ steps as a chain with `{previous}` placeholders
+- `cwd`: optional default working directory for all steps
+- `runTitle`: optional tracking title for the parent run item
 
 ## Subagent Todo Tracking
 
-Todo tracking is enabled by default on the `subagent` tool.
+Todo tracking is always attempted on the `subagent` tool.
 
-- `todo.enabled`: set to `false` to disable tracking for the current subagent invocation
-- `todo.queuePath`: optional queue path override (defaults to nearest `.sift/issues.jsonl`)
-- `todo.runTitle`: optional title for the parent run item
-
-When enabled, the extension creates one run item and one task item per delegated subagent task/step, updates status during execution, and closes successful items using the bundled `sq-node` library.
+The extension creates one run item and one task item per delegated subagent task/step, updates status during execution, and closes successful items using the bundled `sq-node` library when queue setup succeeds. The queue is resolved once per tool invocation from the top-level `cwd` when provided, otherwise from the shared resolved step `cwd` when all steps agree, else from the current working directory.
 
 ## Third-party Notices
 

@@ -2,7 +2,8 @@
 name: search
 description: Amp-style fast parallel code search subagent
 tools: read, grep, find, ls, bash
-model: openai-codex/gpt-5.4-mini
+model: gpt-5.4-mini
+fallbackModel: openai-codex/gpt-5.4-mini
 thinking: medium
 ---
 

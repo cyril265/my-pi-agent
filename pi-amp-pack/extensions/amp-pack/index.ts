@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import registerWorkflowPresets from "./presets";
 import registerSubagentExtension from "./subagent/index";
+import registerSystemEvalExtension from "./system-eval";
 
 interface SyncResult {
   copied: number;
@@ -78,6 +79,7 @@ export default function (pi: ExtensionAPI) {
   const syncResult = syncPackagedAgents();
 
   registerWorkflowPresets(pi);
+  registerSystemEvalExtension(pi);
 
   pi.on("session_start", async (_event, ctx) => {
     const changedCount = syncResult.copied + syncResult.updated;

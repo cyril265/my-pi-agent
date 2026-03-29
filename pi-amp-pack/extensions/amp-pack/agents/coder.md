@@ -2,7 +2,8 @@
 name: coder
 description: fast worker agent
 tools: read, grep, find, ls, bash, edit, write
-model: openai-codex/gpt-5.4-mini
+model: gpt-5.4-mini
+fallbackModel: openai-codex/gpt-5.4-mini
 thinking: medium
 ---
 

@@ -2,7 +2,8 @@
 name: reviewer
 description: Amp-style code review check subagent
 tools: read, grep, find, ls, bash
-model: openai-codex/gpt-5.4
+model: gpt-5.4
+fallbackModel: openai-codex/gpt-5.4
 thinking: medium
 ---
 

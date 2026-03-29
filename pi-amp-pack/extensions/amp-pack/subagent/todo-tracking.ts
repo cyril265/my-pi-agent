@@ -4,12 +4,6 @@ import type { Message } from "@mariozechner/pi-ai";
 const MAX_TODO_TEXT_CHARS = 2400;
 const MAX_TODO_SUMMARY_CHARS = 8000;
 
-export interface TodoTrackingOptions {
-	enabled?: boolean;
-	queuePath?: string;
-	runTitle?: string;
-}
-
 export interface TodoTrackingSingleResult {
 	exitCode: number;
 	messages: Message[];
@@ -62,18 +56,20 @@ export class SqTodoTracker {
 	}
 
 	static async create(
-		defaultCwd: string,
+		queueResolveCwd: string,
 		mode: "single" | "parallel" | "chain",
 		toolCallId: string,
-		todo: TodoTrackingOptions,
+		runTitle: string | undefined,
 	): Promise<SqTodoTracker | null> {
-		if (todo.enabled === false) return null;
-
-		const queuePath = resolveQueuePath({ cwd: defaultCwd, queuePathOverride: todo.queuePath });
-		const runTitle = todo.runTitle?.trim() ? todo.runTitle.trim() : `Subagent ${mode} run`;
-		const tracker = new SqTodoTracker(queuePath, mode, runTitle, toolCallId);
-		await tracker.initialize();
-		return tracker;
+		try {
+			const queuePath = resolveQueuePath({ cwd: queueResolveCwd });
+			const resolvedRunTitle = runTitle?.trim() ? runTitle.trim() : `Subagent ${mode} run`;
+			const tracker = new SqTodoTracker(queuePath, mode, resolvedRunTitle, toolCallId);
+			await tracker.initialize();
+			return tracker;
+		} catch {
+			return null;
+		}
 	}
 
 	private addWarning(message: string) {
