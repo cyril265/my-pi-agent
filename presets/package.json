@@ -1,0 +1,5 @@
+{
+  "name": "pi-preset-extension",
+  "private": true,
+  "main": "./index.ts"
+}
