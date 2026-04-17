@@ -14,5 +14,8 @@
     "extensions": [
       "./extensions"
     ]
+  },
+  "dependencies": {
+    "@marckrenn/pi-sub-bar": "^1.5.0"
   }
 }
