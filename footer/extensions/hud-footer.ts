@@ -490,7 +490,7 @@ function buildFooterLine(theme: Theme, branch: string | null, statuses: FooterSt
 	return joinSegments(theme, segments);
 }
 
-function buildFooter(ctx: ExtensionContext): void {
+function buildFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	ctx.ui.setFooter((tui, theme, footerData) => {
 		const unsubscribeBranch = footerData.onBranchChange(() => tui.requestRender());
 		const requestRender = () => tui.requestRender();
@@ -505,6 +505,7 @@ function buildFooter(ctx: ExtensionContext): void {
 			},
 			invalidate() {},
 			render(width: number): string[] {
+				syncRuntimeState(pi, ctx);
 				const branch = footerData.getGitBranch();
 				const providerName = runtimeState.currentModel.provider;
 				const statuses = getFooterStatuses(
@@ -522,14 +523,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		syncRuntimeState(pi, ctx);
 		if (!ctx.hasUI) return;
-		buildFooter(ctx);
+		buildFooter(pi, ctx);
 		void refreshCodexUsage(ctx, { force: true });
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
 		syncRuntimeState(pi, ctx);
 		if (!ctx.hasUI) return;
-		buildFooter(ctx);
+		buildFooter(pi, ctx);
 		void refreshCodexUsage(ctx, { force: true });
 	});
 
