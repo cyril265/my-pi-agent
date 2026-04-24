@@ -10,6 +10,7 @@
  *   - Chain: { sequential: true, steps: [{ agent: "name", task: "... {previous} ..." }, ...] }
  *
  * Uses JSON mode to capture structured output from subagents.
+ * Persists final run artifacts under repo-local .tmp and indexes them in sq metadata so callers can inspect full outputs later via subagent_result.
  */
 
 import * as fs from "node:fs";
@@ -22,6 +23,14 @@ import { type ExtensionAPI, getMarkdownTheme } from "@mariozechner/pi-coding-age
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { runPiJsonProcess, writePromptToTempFile } from "../pi-process";
+import {
+	persistSubagentRunArtifacts,
+	readSubagentRunStep,
+	readSubagentRunSummary,
+	type PersistableSubagentResult,
+	type SubagentArtifactBundle,
+	type SubagentMode,
+} from "./artifacts.js";
 import { type AgentConfig, type AgentDiscoveryResult, type AgentThinkingLevel, discoverAgents } from "./agents.js";
 import { SqTodoTracker, extractSummaryLines, getResultSummaryText, withTodoTrackingNote } from "./todo-tracking.js";
 
@@ -230,24 +239,17 @@ interface UsageStats {
 	turns: number;
 }
 
-interface SingleResult {
-	agent: string;
+interface SingleResult extends PersistableSubagentResult {
 	agentSource: AgentSource;
-	task: string;
-	exitCode: number;
-	messages: Message[];
-	stderr: string;
 	usage: UsageStats;
-	model?: string;
 	thinkingLevel?: EffectiveThinkingLevel;
-	stopReason?: string;
-	errorMessage?: string;
-	step?: number;
 }
 
 interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
+	mode: SubagentMode;
 	results: SingleResult[];
+	artifacts?: SubagentArtifactBundle;
+	artifactError?: string;
 	blocked?: boolean;
 	reason?: string;
 }
@@ -379,6 +381,35 @@ function attachProgressSummary(partial: AgentToolResult<SubagentDetails>, progre
 		content.unshift({ type: "text", text: summary });
 	}
 	return { ...partial, content };
+}
+
+function getArtifactNoticeLines(details: SubagentDetails | undefined): string[] {
+	if (details?.artifacts) {
+		return [
+			`Subagent run: ${details.artifacts.runId}`,
+			`Summary file: ${details.artifacts.summaryFile}`,
+			"Use subagent_result with runId and optional stepIndex for full outputs.",
+		];
+	}
+	if (details?.artifactError) {
+		return [`Artifacts unavailable: ${details.artifactError}`];
+	}
+	return [];
+}
+
+function attachArtifactSummary(result: AgentToolResult<SubagentDetails>): AgentToolResult<SubagentDetails> {
+	const noticeLines = getArtifactNoticeLines(result.details as SubagentDetails | undefined);
+	if (noticeLines.length === 0) return result;
+	const content = [...result.content];
+	const firstTextIndex = content.findIndex((part) => part.type === "text");
+	const notice = noticeLines.join("\n");
+	if (firstTextIndex >= 0) {
+		const current = content[firstTextIndex];
+		if (current.type === "text") content[firstTextIndex] = { ...current, text: `${notice}\n\n${current.text}` };
+	} else {
+		content.unshift({ type: "text", text: notice });
+	}
+	return { ...result, content };
 }
 
 function wrapTaskPreview(task: string, maxLineLength = 96, maxLines = 3): string {
@@ -545,6 +576,7 @@ async function runSingleAgent(
 	preferredProvider: string | undefined,
 	modelRegistry: ModelRegistryLookup,
 	cwd: string | undefined,
+	stepIndex: number,
 	step: number | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
@@ -559,10 +591,12 @@ async function runSingleAgent(
 			agent: resolved.unknownAgentName ?? agentName,
 			agentSource: "unknown",
 			task,
+			taskCwd: cwd ?? defaultCwd,
 			exitCode: 1,
 			messages: [],
 			stderr: `Unknown agent: "${resolved.unknownAgentName ?? agentName}". Available agents: ${available}.`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			stepIndex,
 			step,
 		};
 	}
@@ -581,10 +615,12 @@ async function runSingleAgent(
 		agent: agent.name,
 		agentSource: agent.source,
 		task,
+		taskCwd: cwd ?? defaultCwd,
 		exitCode: 0,
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		stepIndex,
 		model: agent.model,
 		thinkingLevel: effectiveThinking,
 		step,
@@ -705,6 +741,14 @@ const SubagentParams = Type.Object(
 	{ additionalProperties: false },
 );
 
+const SubagentResultParams = Type.Object(
+	{
+		runId: Type.String({ description: "Run id returned by subagent." }),
+		stepIndex: Type.Optional(Type.Number({ minimum: 0, description: "Optional zero-based step index to fetch a single step result." })),
+	},
+	{ additionalProperties: false },
+);
+
 interface StepInput {
 	agent: RequestedAgent;
 	task: string;
@@ -715,6 +759,25 @@ interface StepInput {
 interface AgentInvocation {
 	taskCwd: string;
 	discovery: AgentDiscoveryResult;
+}
+
+interface SubagentResultDetails {
+	runId: string;
+	mode: SubagentMode;
+	runDir: string;
+	queuePath: string;
+	summaryFile: string;
+	stepIndex?: number;
+	outputFile?: string;
+	rawFile?: string;
+	availableSteps: Array<{
+		stepIndex: number;
+		step?: number;
+		agent: string;
+		status: "succeeded" | "failed";
+		outputFile: string;
+		rawFile: string;
+	}>;
 }
 
 function resolveInvocationCwd(defaultCwd: string, requestedCwd: string | undefined): string {
@@ -814,6 +877,7 @@ export default function (pi: ExtensionAPI) {
 			"Set `sequential:true` to run steps as a chain with optional {previous} placeholders.",
 			"Each step agent can be a saved agent name or an inline generic agent object with systemPrompt, tools, model, and thinking.",
 			"Thinking is configured per step; use thinking: \"inherit\" to use the caller's current thinking level.",
+			"Returns a runId and saves full outputs under repo-local .tmp so you can inspect them later with subagent_result.",
 			"Uses user agents from ~/.pi/agent/agents.",
 			"Todo tracking is always attempted in the nearest .sift/issues.jsonl queue for the invocation.",
 		].join(" "),
@@ -854,9 +918,27 @@ export default function (pi: ExtensionAPI) {
 			const trackingCwd = resolveTrackingCwd(params, ctx.cwd);
 			const todoTracker = await SqTodoTracker.create(trackingCwd, mode, toolCallId, params.runTitle);
 			const finalizeAndReturn = async (result: AgentToolResult<SubagentDetails>) => {
-				const withProgress = attachProgressSummary(result, progressTracker);
-				await todoTracker?.finalize(!result.isError, getResultSummaryText(withProgress));
-				return withTodoTrackingNote(withProgress, todoTracker?.statusNote());
+				const details = result.details ?? makeDetails(mode)([]);
+				const persisted = await persistSubagentRunArtifacts(
+					trackingCwd,
+					todoTracker?.getRunId(),
+					mode,
+					toolCallId,
+					details.results,
+					trackingCwd,
+				);
+				const resultWithArtifacts: AgentToolResult<SubagentDetails> = {
+					...result,
+					details: {
+						...details,
+						artifacts: persisted.artifacts,
+						artifactError: persisted.error,
+					},
+				};
+				const withProgress = attachProgressSummary(resultWithArtifacts, progressTracker);
+				const withArtifacts = attachArtifactSummary(withProgress);
+				await todoTracker?.finalize(!result.isError, getResultSummaryText(withArtifacts));
+				return withTodoTrackingNote(withArtifacts, todoTracker?.statusNote());
 			};
 
 			try {
@@ -908,6 +990,7 @@ export default function (pi: ExtensionAPI) {
 								ctx.model?.provider,
 								ctx.modelRegistry,
 								invocation.taskCwd,
+								i,
 								i + 1,
 								signal,
 								chainUpdate,
@@ -961,10 +1044,12 @@ export default function (pi: ExtensionAPI) {
 							agent: getAgentDisplayName(params.steps[i].agent),
 							agentSource: "unknown",
 							task: params.steps[i].task,
+							taskCwd: resolveStepCwd(params.steps[i], params, ctx.cwd),
 							exitCode: -1,
 							messages: [],
 							stderr: "",
 							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+							stepIndex: i,
 							thinkingLevel: resolveThinkingLevel(
 								params.steps[i].thinking,
 								isGenericAgentSpec(params.steps[i].agent) ? params.steps[i].agent.thinking : undefined,
@@ -998,6 +1083,7 @@ export default function (pi: ExtensionAPI) {
 								ctx.model?.provider,
 								ctx.modelRegistry,
 								invocation.taskCwd,
+								index,
 								undefined,
 								signal,
 								(partial) => {
@@ -1030,7 +1116,7 @@ export default function (pi: ExtensionAPI) {
 						const failed = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
 						const output = failed ? getResultErrorText(r) : getResultDisplayText(r);
 						const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
-						return `[${r.agent}] ${failed ? "failed" : "completed"}: ${preview || "(no output)"}`;
+						return `[#${r.stepIndex} ${r.agent}] ${failed ? "failed" : "completed"}: ${preview || "(no output)"}`;
 					});
 
 					return await finalizeAndReturn({
@@ -1064,6 +1150,7 @@ export default function (pi: ExtensionAPI) {
 							ctx.model?.provider,
 							ctx.modelRegistry,
 							invocation.taskCwd,
+							0,
 							undefined,
 							signal,
 							emitProgressUpdate,
@@ -1170,6 +1257,14 @@ export default function (pi: ExtensionAPI) {
 		renderResult(result, { expanded }, theme) {
 			const details = result.details as SubagentDetails | undefined;
 			const summaryLines = extractSummaryLines(result);
+			const artifactSummaryLines = details?.artifacts
+				? [
+					`Artifacts: ${details.artifacts.runId}`,
+					`Summary: ${details.artifacts.summaryFile}`,
+				]
+				: details?.artifactError
+					? [`Artifacts unavailable: ${details.artifactError}`]
+					: [];
 			if (!details || details.results.length === 0) {
 				const text = result.content[0];
 				const message = text?.type === "text" ? text.text : "(no output)";
@@ -1199,8 +1294,9 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const appendSummaryHeader = (container: Container) => {
-				if (summaryLines.progress.length === 0 && !summaryLines.todo) return;
+				if (summaryLines.progress.length === 0 && artifactSummaryLines.length === 0 && !summaryLines.todo) return;
 				for (const line of summaryLines.progress) container.addChild(new Text(theme.fg("accent", line), 0, 0));
+				for (const line of artifactSummaryLines) container.addChild(new Text(theme.fg("muted", line), 0, 0));
 				if (summaryLines.todo) container.addChild(new Text(theme.fg("muted", summaryLines.todo), 0, 0));
 				container.addChild(new Spacer(1));
 			};
@@ -1208,6 +1304,7 @@ export default function (pi: ExtensionAPI) {
 			const buildSummaryPrefix = () => {
 				const parts: string[] = [];
 				for (const line of summaryLines.progress) parts.push(theme.fg("accent", line));
+				for (const line of artifactSummaryLines) parts.push(theme.fg("muted", line));
 				if (summaryLines.todo) parts.push(theme.fg("muted", summaryLines.todo));
 				return parts.length > 0 ? `${parts.join("\n")}\n\n` : "";
 			};
@@ -1311,7 +1408,7 @@ export default function (pi: ExtensionAPI) {
 						const errorText = rIsError ? getResultErrorText(r) : "";
 
 						container.addChild(new Spacer(1));
-						const stepHeader = `${theme.fg("muted", `─── Step ${r.step}: `) + theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
+						const stepHeader = `${theme.fg("muted", `─── Step ${r.step} [#${r.stepIndex}]: `) + theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
 						container.addChild(new Text(stepHeader, 0, 0));
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 						if (rIsError && errorText) container.addChild(new Text(theme.fg("error", `Error: ${errorText}`), 0, 0));
@@ -1359,7 +1456,7 @@ export default function (pi: ExtensionAPI) {
 					const rIcon = rIsError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
 					const errorText = rIsError ? getResultErrorText(r) : "";
-					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
+					text += `\n\n${theme.fg("muted", `─── Step ${r.step} [#${r.stepIndex}]: `)}${theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
 					if (rIsError && errorText) text += `\n${theme.fg("error", `Error: ${errorText}`)}`;
 					else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
@@ -1405,7 +1502,7 @@ export default function (pi: ExtensionAPI) {
 						const errorText = rIsError ? getResultErrorText(r) : "";
 
 						container.addChild(new Spacer(1));
-						const taskHeader = `${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
+						const taskHeader = `${theme.fg("muted", `─── [#${r.stepIndex}] `) + theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
 						container.addChild(new Text(taskHeader, 0, 0));
 						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 						if (rIsError && errorText) container.addChild(new Text(theme.fg("error", `Error: ${errorText}`), 0, 0));
@@ -1453,7 +1550,7 @@ export default function (pi: ExtensionAPI) {
 								: theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
 					const errorText = rIsError ? getResultErrorText(r) : "";
-					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
+					text += `\n\n${theme.fg("muted", `─── [#${r.stepIndex}] `)}${theme.fg("accent", r.agent)} ${rIcon}${formatResultMeta(r, theme)}`;
 					if (rIsError && errorText) text += `\n${theme.fg("error", `Error: ${errorText}`)}`;
 					else if (displayItems.length === 0)
 						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
@@ -1469,6 +1566,97 @@ export default function (pi: ExtensionAPI) {
 
 			const text = result.content[0];
 			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_result",
+		label: "Subagent Result",
+		description: [
+			"Fetch saved output from a previous subagent run.",
+			"Use the runId returned by subagent.",
+			"Without stepIndex it returns the saved run summary.",
+			"With stepIndex it returns the saved output for that zero-based step.",
+		].join(" "),
+		parameters: SubagentResultParams,
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const normalizedRunId = params.runId.trim();
+			const normalizedStepIndex = Number.isFinite(params.stepIndex) ? Math.floor(params.stepIndex!) : undefined;
+			const queueResolveCwd = ctx.cwd;
+
+			try {
+				if (normalizedStepIndex !== undefined) {
+					const { run, step, content } = await readSubagentRunStep(queueResolveCwd, normalizedRunId, normalizedStepIndex);
+					const details: SubagentResultDetails = {
+						runId: run.runId,
+						mode: run.mode,
+						runDir: run.runDir,
+						queuePath: run.queuePath,
+						summaryFile: run.summaryFile,
+						stepIndex: step.stepIndex,
+						outputFile: step.outputFile,
+						rawFile: step.rawFile,
+						availableSteps: run.steps.map((candidate) => ({
+							stepIndex: candidate.stepIndex,
+							step: candidate.step,
+							agent: candidate.agent,
+							status: candidate.status,
+							outputFile: candidate.outputFile,
+							rawFile: candidate.rawFile,
+						})),
+					};
+					return {
+						content: [{ type: "text", text: content }],
+						details,
+					};
+				}
+
+				const { run, content } = await readSubagentRunSummary(queueResolveCwd, normalizedRunId);
+				const details: SubagentResultDetails = {
+					runId: run.runId,
+					mode: run.mode,
+					runDir: run.runDir,
+					queuePath: run.queuePath,
+					summaryFile: run.summaryFile,
+					availableSteps: run.steps.map((candidate) => ({
+						stepIndex: candidate.stepIndex,
+						step: candidate.step,
+						agent: candidate.agent,
+						status: candidate.status,
+						outputFile: candidate.outputFile,
+						rawFile: candidate.rawFile,
+					})),
+				};
+				return {
+					content: [{ type: "text", text: content }],
+					details,
+				};
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return {
+					content: [{ type: "text", text: `subagent_result failed: ${message}` }],
+					isError: true,
+				};
+			}
+		},
+
+		renderCall(args, theme) {
+			const runId = typeof args.runId === "string" ? args.runId : "...";
+			const stepIndex = typeof args.stepIndex === "number" ? args.stepIndex : undefined;
+			const text = stepIndex === undefined
+				? `${theme.fg("toolTitle", theme.bold("subagent_result "))}${theme.fg("accent", runId)}`
+				: `${theme.fg("toolTitle", theme.bold("subagent_result "))}${theme.fg("accent", runId)}${theme.fg("muted", ` stepIndex:${stepIndex}`)}`;
+			return new Text(text, 0, 0);
+		},
+
+		renderResult(result, { expanded }) {
+			const text = result.content.find((part) => part.type === "text");
+			const message = text?.type === "text" ? text.text : "(no output)";
+			if (expanded || message.includes("\n")) {
+				return new Markdown(message, 0, 0, getMarkdownTheme());
+			}
+			return new Text(message, 0, 0);
 		},
 	});
 }

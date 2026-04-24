@@ -7,8 +7,6 @@ import { loadSettings as loadSubBarSettings } from "@marckrenn/pi-sub-bar/src/se
 import type { RateWindow, UsageError, UsageSnapshot } from "@marckrenn/pi-sub-bar/src/types.js";
 
 class FooterStatuses {
-	preset?: string;
-	mcp?: string;
 	others: string[] = [];
 }
 
@@ -34,9 +32,15 @@ type FooterModelState = {
 	reasoning?: boolean;
 };
 
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
 class FooterRuntimeState {
 	requestRender?: () => void;
 	currentModel: FooterModelState = {};
+	currentDirectory = "?";
+	contextPercent: number | null = null;
+	openRouterTotalCost = 0;
+	thinkingLevel: ThinkingLevel = "off";
 	codexUsage: CodexUsageState = { loading: false };
 	codexUsageCache = new Map<string, CodexUsageState>();
 	codexUsageRequestId = 0;
@@ -78,25 +82,8 @@ function getFooterStatuses(entries: Array<[string, string]>, providerName: strin
 		const status = sanitizeStatusText(rawText);
 		if (!status) continue;
 
-		if (!result.preset && key === "preset") {
-			result.preset = status;
-			continue;
-		}
-
-		if (!result.mcp && key.toLowerCase().includes("mcp")) {
-			result.mcp = status;
-			continue;
-		}
-
-		if (!result.preset && /^preset\s*:/i.test(status)) {
-			result.preset = status;
-			continue;
-		}
-
-		if (!result.mcp && /^mcp\s*:/i.test(status)) {
-			result.mcp = status;
-			continue;
-		}
+		if (key === "preset" || key.toLowerCase().includes("mcp")) continue;
+		if (/^(preset|mcp)\s*:/i.test(status)) continue;
 
 		result.others.push(status);
 	}
@@ -175,13 +162,11 @@ function getTotalAssistantCost(ctx: ExtensionContext): number {
 	return totalCost;
 }
 
-function buildOpenRouterCostSegment(ctx: ExtensionContext, theme: Theme): string {
+function buildOpenRouterCostSegment(theme: Theme): string {
 	if (runtimeState.currentModel.provider !== "openrouter") return "";
+	if (runtimeState.openRouterTotalCost <= 0) return "";
 
-	const totalCost = getTotalAssistantCost(ctx);
-	if (totalCost <= 0) return "";
-
-	return theme.bold(`$${totalCost.toFixed(3)}`);
+	return theme.bold(`$${runtimeState.openRouterTotalCost.toFixed(3)}`);
 }
 
 function getRecord(value: unknown): Record<string, unknown> | undefined {
@@ -277,13 +262,25 @@ async function readResponseError(response: Response): Promise<string> {
 	return `HTTP ${response.status}: ${raw}`;
 }
 
-function syncCurrentModel(ctx: ExtensionContext): void {
+function syncRuntimeState(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	runtimeState.currentModel = {
 		provider: ctx.model?.provider,
 		id: ctx.model?.id,
 		name: ctx.model?.name,
 		reasoning: ctx.model?.reasoning,
 	};
+	runtimeState.currentDirectory = getCurrentDirectoryName(ctx.sessionManager.getCwd());
+	runtimeState.contextPercent = ctx.getContextUsage()?.percent ?? null;
+	runtimeState.openRouterTotalCost = getTotalAssistantCost(ctx);
+	runtimeState.thinkingLevel = ctx.model?.reasoning ? pi.getThinkingLevel() : "off";
+}
+
+function clearRuntimeState(): void {
+	runtimeState.currentModel = {};
+	runtimeState.currentDirectory = "?";
+	runtimeState.contextPercent = null;
+	runtimeState.openRouterTotalCost = 0;
+	runtimeState.thinkingLevel = "off";
 }
 
 function getActiveCodexProvider(): string | undefined {
@@ -472,31 +469,19 @@ function buildCodexQuotaSegment(theme: Theme): string {
 	return formatted?.trim() || theme.fg("warning", "quota?");
 }
 
-function buildFooterLine(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	theme: Theme,
-	branch: string | null,
-	statuses: FooterStatuses,
-): string {
-	const contextUsage = ctx.getContextUsage();
-	const contextPercent = contextUsage?.percent ?? null;
+function buildFooterLine(theme: Theme, branch: string | null, statuses: FooterStatuses): string {
 	const provider = truncateToWidth(runtimeState.currentModel.provider ?? "no provider", 18, "…");
 	const model = truncateToWidth(runtimeState.currentModel.name ?? runtimeState.currentModel.id ?? "no model", 28, "…");
-	const thinkingLevel = runtimeState.currentModel.reasoning ? pi.getThinkingLevel() : "off";
-	const directory = getCurrentDirectoryName(ctx.sessionManager.getCwd());
-	const openRouterCostSegment = buildOpenRouterCostSegment(ctx, theme);
+	const openRouterCostSegment = buildOpenRouterCostSegment(theme);
 	const codexQuotaSegment = buildCodexQuotaSegment(theme);
 
 	const segments = [
-		`${theme.fg("dim", "⌂ ")}${theme.fg("accent", theme.bold(directory))}`,
+		`${theme.fg("dim", "⌂ ")}${theme.fg("accent", theme.bold(runtimeState.currentDirectory))}`,
 		branch ? `${theme.fg("dim", "⎇ ")}${theme.fg("success", truncateToWidth(branch, 24, "…"))}` : "",
-		styleContextPercent(theme, contextPercent),
+		styleContextPercent(theme, runtimeState.contextPercent),
 		blue(provider),
 		theme.bold(model),
-		theme.fg(getThinkingColor(thinkingLevel), theme.bold(thinkingLevel)),
-		statuses.preset ? blue(statuses.preset) : "",
-		statuses.mcp ?? "",
+		theme.fg(getThinkingColor(runtimeState.thinkingLevel), theme.bold(runtimeState.thinkingLevel)),
 		openRouterCostSegment,
 		codexQuotaSegment,
 		...statuses.others,
@@ -505,7 +490,7 @@ function buildFooterLine(
 	return joinSegments(theme, segments);
 }
 
-function buildFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
+function buildFooter(ctx: ExtensionContext): void {
 	ctx.ui.setFooter((tui, theme, footerData) => {
 		const unsubscribeBranch = footerData.onBranchChange(() => tui.requestRender());
 		const requestRender = () => tui.requestRender();
@@ -527,7 +512,7 @@ function buildFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 					providerName,
 				);
 
-				return [truncateToWidth(buildFooterLine(pi, ctx, theme, branch, statuses), width, theme.fg("dim", "…"))];
+				return [truncateToWidth(buildFooterLine(theme, branch, statuses), width, theme.fg("dim", "…"))];
 			},
 		};
 	});
@@ -535,29 +520,44 @@ function buildFooter(pi: ExtensionAPI, ctx: ExtensionContext): void {
 
 export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
-		syncCurrentModel(ctx);
+		syncRuntimeState(pi, ctx);
 		if (!ctx.hasUI) return;
-		buildFooter(pi, ctx);
+		buildFooter(ctx);
 		void refreshCodexUsage(ctx, { force: true });
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
-		syncCurrentModel(ctx);
+		syncRuntimeState(pi, ctx);
 		if (!ctx.hasUI) return;
-		buildFooter(pi, ctx);
+		buildFooter(ctx);
 		void refreshCodexUsage(ctx, { force: true });
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
-		syncCurrentModel(ctx);
+		syncRuntimeState(pi, ctx);
 		if (!ctx.hasUI) return;
 		void refreshCodexUsage(ctx);
 		runtimeState.requestRender?.();
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_tree", async (_event, ctx) => {
+		syncRuntimeState(pi, ctx);
+		if (!ctx.hasUI) return;
+		runtimeState.requestRender?.();
+	});
+
+	pi.on("session_compact", async (_event, ctx) => {
+		syncRuntimeState(pi, ctx);
+		if (!ctx.hasUI) return;
+		runtimeState.requestRender?.();
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (ctx.hasUI) {
+			ctx.ui.setFooter(undefined);
+		}
 		clearCodexUsage();
-		runtimeState.currentModel = {};
+		clearRuntimeState();
 		runtimeState.requestRender = undefined;
 	});
 }

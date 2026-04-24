@@ -139,6 +139,10 @@ export class SqTodoTracker {
 		}
 	}
 
+	getRunId(): string | undefined {
+		return this.runId;
+	}
+
 	getTaskId(taskKey: string): string | undefined {
 		return this.taskIds.get(taskKey);
 	}
