@@ -1,5 +1,7 @@
+import { randomInt } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -54,9 +56,25 @@ function getFinalOutput(messages: Message[]): string {
   return "";
 }
 
-function getRunDirectory(cwd: string): string {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return path.join(cwd, ".subagents", timestamp);
+const idChars = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+function getRandomId(): string {
+  let id = "";
+  for (let i = 0; i < 10; i++) id += idChars[randomInt(idChars.length)];
+  return id;
+}
+
+function createRunDirectory(): string {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const runDirectory = path.join(os.tmpdir(), getRandomId());
+    try {
+      fs.mkdirSync(runDirectory);
+      return runDirectory;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+  throw new Error("Failed to create random subagent directory");
 }
 
 function sanitizeFileName(name: string): string {
@@ -309,54 +327,10 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
-    name: "runSubAgent",
-    parameters: Type.Object({
-      thinking: Type.Union([
-        Type.Literal("off"),
-        Type.Literal("minimal"),
-        Type.Literal("low"),
-        Type.Literal("medium"),
-        Type.Literal("high"),
-        Type.Literal("xhigh"),
-      ]),
-      prompt: Type.String(),
-      cwd: Type.String(),
-    }),
-    renderCall(args, theme) {
-      const text = [
-        theme.fg("toolTitle", theme.bold("runSubAgent")),
-        theme.fg("muted", ` - thinking:${args.thinking} - cwd:${getCwdLabel(args.cwd)}`),
-        "\n",
-        theme.fg("toolOutput", truncate(args.prompt, 400)),
-      ].join("");
-      return new Text(text, 0, 0);
-    },
-    renderResult(result, _options, theme) {
-      const content = result.content[0];
-      const text = content?.type === "text" ? content.text : "(no output)";
-      return new Text(`\n${theme.fg("muted", "result:")}\n${text}`, 0, 0);
-    },
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-      if (!model) throw new Error("No caller model");
-
-      const result = await runSubAgent(model, params.thinking, params.prompt, params.cwd, signal, (text) => {
-        onUpdate?.({
-          content: [{ type: "text", text }],
-        });
-      });
-
-      return {
-        content: [{ type: "text", text: result.text }],
-        isError: result.exitCode !== 0,
-      };
-    },
-  });
 
   pi.registerTool({
     name: "runSubAgents",
-    description: "Run multiple independent subagents in parallel. Each subagent writes its result to .subagents/<timestamp>/<name>-result.md.",
+    description: "Run multiple independent subagents in parallel. Each subagent writes its result to /tmp/<random-id>/<name>-result.md.",
     parameters: Type.Object({
       agents: Type.Array(
         Type.Object({
@@ -398,8 +372,7 @@ export default function (pi: ExtensionAPI) {
       if (!model) throw new Error("No caller model");
       if (params.agents.length === 0) throw new Error("No agents");
 
-      const runDirectory = getRunDirectory(ctx.cwd);
-      fs.mkdirSync(runDirectory, { recursive: true });
+      const runDirectory = createRunDirectory();
 
       const results = await Promise.all(
         params.agents.map(async (agent, index) => {

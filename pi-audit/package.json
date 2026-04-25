@@ -1,0 +1,17 @@
+{
+  "name": "pi-audit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "pi-audit": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/index.ts",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^6.0.3"
+  }
+}

@@ -1,9 +1,8 @@
 # simple-subagent
 
-Tiny pi extension. Adds two tools:
+Tiny pi extension. Adds one tool:
 
-- `runSubAgent(thinking, prompt, cwd)`
-- `runSubAgents({ agents: [{ name, thinking, prompt, cwd }] })` writes results to `.subagents/<timestamp>/<name>-result.md`
+- `runSubAgents({ agents: [{ name, thinking, prompt, cwd }] })` writes results to `/tmp/<random-id>/<name>-result.md`
 
 ## Install
 
