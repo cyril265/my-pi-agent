@@ -1,7 +1,7 @@
 /**
  * Preset Extension
  *
- * Allows defining named presets that configure model, thinking level, tools,
+ * Allows defining named presets that configure model, thinking level, readonly mode,
  * and system prompt instructions. Presets are defined in JSON config files
  * and can be activated via CLI flag, /preset command, or Ctrl+Shift+U to cycle.
  *
@@ -16,14 +16,13 @@
  *     "provider": "openai-codex",
  *     "model": "gpt-5.2-codex",
  *     "thinkingLevel": "high",
- *     "tools": ["read", "grep", "find", "ls"],
+ *     "readonly": true,
  *     "instructions": "You are in PLANNING MODE. Your job is to deeply understand the problem and create a detailed implementation plan.\n\nRules:\n- DO NOT make any changes. You cannot edit or write files.\n- Read files IN FULL (no offset/limit) to get complete context. Partial reads miss critical details.\n- Explore thoroughly: grep for related code, find similar patterns, understand the architecture.\n- Ask clarifying questions if requirements are ambiguous. Do not assume.\n- Identify risks, edge cases, and dependencies before proposing solutions.\n\nOutput:\n- Create a structured plan with numbered steps.\n- For each step: what to change, why, and potential risks.\n- List files that will be modified.\n- Note any tests that should be added or updated.\n\nWhen done, ask the user if they want you to:\n1. Write the plan to a markdown file (e.g., PLAN.md)\n2. Create a GitHub issue with the plan\n3. Proceed to implementation (they should switch to 'implement' preset)"
  *   },
  *   "implement": {
  *     "provider": "anthropic",
  *     "model": "claude-sonnet-4-5",
  *     "thinkingLevel": "high",
- *     "tools": ["read", "bash", "edit", "write"],
  *     "instructions": "You are in IMPLEMENTATION MODE. Your job is to make focused, correct changes.\n\nRules:\n- Keep scope tight. Do exactly what was asked, no more.\n- Read files before editing to understand current state.\n- Make surgical edits. Prefer edit over write for existing files.\n- Explain your reasoning briefly before each change.\n- Run tests or type checks after changes if the project has them (npm test, npm run check, etc.).\n- If you encounter unexpected complexity, STOP and explain the issue rather than hacking around it.\n\nIf no plan exists:\n- Ask clarifying questions before starting.\n- Propose what you'll do and get confirmation for non-trivial changes.\n\nAfter completing changes:\n- Summarize what was done.\n- Note any follow-up work or tests that should be added."
  *   }
  * }
@@ -47,6 +46,8 @@ import { Container, Key, type SelectItem, SelectList, Text } from "@mariozechner
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const DEFAULT_ACTIVE_TOOLS = ["read", "bash", "edit", "write"];
+const WRITE_TOOL_NAMES = new Set(["edit", "write"]);
 
 // Preset configuration
 interface Preset {
@@ -56,8 +57,8 @@ interface Preset {
 	model?: string;
 	/** Thinking level */
 	thinkingLevel?: ThinkingLevel;
-	/** Tools to enable (replaces default set) */
-	tools?: string[];
+	/** Enable read-only mode by removing write tools from default active tools */
+	"readonly"?: boolean;
 	/** Instructions to append to system prompt */
 	instructions?: string;
 }
@@ -109,6 +110,7 @@ export default function presetExtension(pi: ExtensionAPI) {
 	let presets: PresetsConfig = {};
 	let activePresetName: string | undefined;
 	let activePreset: Preset | undefined;
+	let toolsBeforeReadonly: string[] | undefined;
 
 	// Register --preset CLI flag
 	pi.registerFlag("preset", {
@@ -116,10 +118,34 @@ export default function presetExtension(pi: ExtensionAPI) {
 		type: "string",
 	});
 
+	function applyReadonlyMode(preset: Preset, fallbackToDefaultTools: boolean) {
+		const currentToolNames = pi.getActiveTools().map((tool) => tool.name);
+		const baseToolNames = fallbackToDefaultTools && currentToolNames.length === 0 ? DEFAULT_ACTIVE_TOOLS : currentToolNames;
+
+		if (preset.readonly) {
+			if (!activePreset?.readonly && !toolsBeforeReadonly) {
+				toolsBeforeReadonly = baseToolNames;
+			}
+
+			const activeTools = baseToolNames.filter((toolName) => !WRITE_TOOL_NAMES.has(toolName));
+			pi.setActiveTools(activeTools);
+		} else if (activePreset?.readonly) {
+			const restoredTools =
+				toolsBeforeReadonly ?? (fallbackToDefaultTools ? [...new Set([...baseToolNames, ...DEFAULT_ACTIVE_TOOLS])] : baseToolNames);
+			pi.setActiveTools(restoredTools);
+			toolsBeforeReadonly = undefined;
+		}
+	}
+
 	/**
 	 * Apply a preset configuration.
 	 */
-	async function applyPreset(name: string, preset: Preset, ctx: ExtensionContext): Promise<boolean> {
+	async function applyPreset(
+		name: string,
+		preset: Preset,
+		ctx: ExtensionContext,
+		fallbackToDefaultTools = false,
+	): Promise<boolean> {
 		// Apply model if specified
 		if (preset.provider && preset.model) {
 			const model = ctx.modelRegistry.find(preset.provider, preset.model);
@@ -138,20 +164,8 @@ export default function presetExtension(pi: ExtensionAPI) {
 			pi.setThinkingLevel(preset.thinkingLevel);
 		}
 
-		// Apply tools if specified
-		if (preset.tools && preset.tools.length > 0) {
-			const allToolNames = pi.getAllTools().map((t) => t.name);
-			const validTools = preset.tools.filter((t) => allToolNames.includes(t));
-			const invalidTools = preset.tools.filter((t) => !allToolNames.includes(t));
-
-			if (invalidTools.length > 0) {
-				ctx.ui.notify(`Preset "${name}": Unknown tools: ${invalidTools.join(", ")}`, "warning");
-			}
-
-			if (validTools.length > 0) {
-				pi.setActiveTools(validTools);
-			}
-		}
+		// Apply readonly mode if enabled, restore previous tools when leaving readonly
+		applyReadonlyMode(preset, fallbackToDefaultTools);
 
 		// Store active preset for system prompt injection
 		activePresetName = name;
@@ -172,8 +186,8 @@ export default function presetExtension(pi: ExtensionAPI) {
 		if (preset.thinkingLevel) {
 			parts.push(`thinking:${preset.thinkingLevel}`);
 		}
-		if (preset.tools) {
-			parts.push(`tools:${preset.tools.join(",")}`);
+		if (preset.readonly) {
+			parts.push("readonly");
 		}
 		if (preset.instructions) {
 			const truncated =
@@ -210,7 +224,7 @@ export default function presetExtension(pi: ExtensionAPI) {
 		items.push({
 			value: "(none)",
 			label: "(none)",
-			description: "Clear active preset, restore defaults",
+			description: "Clear active preset",
 		});
 
 		const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
@@ -256,11 +270,15 @@ export default function presetExtension(pi: ExtensionAPI) {
 		if (!result) return;
 
 		if (result === "(none)") {
-			// Clear preset and restore defaults
+			// Clear preset
+			if (activePreset?.readonly) {
+				applyReadonlyMode({}, false);
+			}
 			activePresetName = undefined;
 			activePreset = undefined;
-			pi.setActiveTools(["read", "bash", "edit", "write"]);
-			ctx.ui.notify("Preset cleared, defaults restored", "info");
+			toolsBeforeReadonly = undefined;
+			pi.appendEntry("preset-state", { name: null });
+			ctx.ui.notify("Preset cleared", "info");
 			updateStatus(ctx);
 			return;
 		}
@@ -268,6 +286,7 @@ export default function presetExtension(pi: ExtensionAPI) {
 		const preset = presets[result];
 		if (preset) {
 			await applyPreset(result, preset, ctx);
+			pi.appendEntry("preset-state", { name: result, toolsBeforeReadonly });
 			ctx.ui.notify(`Preset "${result}" activated`, "info");
 			updateStatus(ctx);
 		}
@@ -357,10 +376,14 @@ export default function presetExtension(pi: ExtensionAPI) {
 		const nextName = cycleList[nextIndex];
 
 		if (nextName === "(none)") {
+			if (activePreset?.readonly) {
+				applyReadonlyMode({}, false);
+			}
 			activePresetName = undefined;
 			activePreset = undefined;
-			pi.setActiveTools(["read", "bash", "edit", "write"]);
-			ctx.ui.notify("Preset cleared, defaults restored", "info");
+			toolsBeforeReadonly = undefined;
+			pi.appendEntry("preset-state", { name: null });
+			ctx.ui.notify("Preset cleared", "info");
 			updateStatus(ctx);
 			return;
 		}
@@ -369,6 +392,7 @@ export default function presetExtension(pi: ExtensionAPI) {
 		if (!preset) return;
 
 		await applyPreset(nextName, preset, ctx);
+		pi.appendEntry("preset-state", { name: nextName, toolsBeforeReadonly });
 		ctx.ui.notify(`Preset "${nextName}" activated`, "info");
 		updateStatus(ctx);
 	}
@@ -396,6 +420,7 @@ export default function presetExtension(pi: ExtensionAPI) {
 				}
 
 				await applyPreset(name, preset, ctx);
+				pi.appendEntry("preset-state", { name, toolsBeforeReadonly });
 				ctx.ui.notify(`Preset "${name}" activated`, "info");
 				updateStatus(ctx);
 				return;
@@ -440,12 +465,31 @@ export default function presetExtension(pi: ExtensionAPI) {
 		// Load presets from config files
 		presets = loadPresets(ctx.cwd);
 
+		const branch = ctx.sessionManager.getBranch();
+		const presetEntry = branch
+			.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "preset-state")
+			.pop() as { data?: { name: string | null; toolsBeforeReadonly?: string[] } } | undefined;
+
+		if (Array.isArray(presetEntry?.data?.toolsBeforeReadonly)) {
+			toolsBeforeReadonly = presetEntry.data.toolsBeforeReadonly;
+		}
+
+		const restoredPreset = presetEntry?.data?.name ? presets[presetEntry.data.name] : undefined;
+
 		// Check for --preset flag
 		const presetFlag = pi.getFlag("preset");
 		if (typeof presetFlag === "string" && presetFlag) {
 			const preset = presets[presetFlag];
 			if (preset) {
-				await applyPreset(presetFlag, preset, ctx);
+				if (restoredPreset?.readonly) {
+					activePresetName = presetEntry?.data?.name;
+					activePreset = restoredPreset;
+				}
+				await applyPreset(presetFlag, preset, ctx, true);
+				if (!preset.readonly && pi.getActiveTools().length === 0) {
+					pi.setActiveTools(DEFAULT_ACTIVE_TOOLS);
+				}
+				pi.appendEntry("preset-state", { name: presetFlag, toolsBeforeReadonly });
 				ctx.ui.notify(`Preset "${presetFlag}" activated`, "info");
 			} else {
 				const available = Object.keys(presets).join(", ") || "(none defined)";
@@ -454,17 +498,17 @@ export default function presetExtension(pi: ExtensionAPI) {
 		}
 
 		// Restore preset from session state
-		const entries = ctx.sessionManager.getEntries();
-		const presetEntry = entries
-			.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "preset-state")
-			.pop() as { data?: { name: string } } | undefined;
-
 		if (presetEntry?.data?.name && !presetFlag) {
 			const preset = presets[presetEntry.data.name];
 			if (preset) {
+				if (!preset.readonly && pi.getActiveTools().length === 0) {
+					pi.setActiveTools(DEFAULT_ACTIVE_TOOLS);
+				} else {
+					applyReadonlyMode(preset, true);
+				}
 				activePresetName = presetEntry.data.name;
 				activePreset = preset;
-				// Don't re-apply model/tools on restore, just keep the name for instructions
+				// Don't re-apply model on restore, just keep the name for instructions
 			}
 		}
 
@@ -474,7 +518,7 @@ export default function presetExtension(pi: ExtensionAPI) {
 	// Persist preset state
 	pi.on("turn_start", async () => {
 		if (activePresetName) {
-			pi.appendEntry("preset-state", { name: activePresetName });
+			pi.appendEntry("preset-state", { name: activePresetName, toolsBeforeReadonly });
 		}
 	});
 }

@@ -7,6 +7,7 @@ import { loadSettings as loadSubBarSettings } from "@marckrenn/pi-sub-bar/src/se
 import type { RateWindow, UsageError, UsageSnapshot } from "@marckrenn/pi-sub-bar/src/types.js";
 
 class FooterStatuses {
+	sandboxActive = false;
 	others: string[] = [];
 }
 
@@ -39,6 +40,8 @@ class FooterRuntimeState {
 	currentModel: FooterModelState = {};
 	currentDirectory = "?";
 	contextPercent: number | null = null;
+	contextTokens: number | null = null;
+	contextWindow: number | null = null;
 	openRouterTotalCost = 0;
 	thinkingLevel: ThinkingLevel = "off";
 	codexUsage: CodexUsageState = { loading: false };
@@ -80,6 +83,10 @@ function getFooterStatuses(entries: Array<[string, string]>, providerName: strin
 		if (shouldHideStatusEntry(key, providerName)) continue;
 
 		const status = sanitizeStatusText(rawText);
+		if (key === "sandbox") {
+			result.sandboxActive = Boolean(status);
+			continue;
+		}
 		if (!status) continue;
 
 		if (key === "preset" || key.toLowerCase().includes("mcp")) continue;
@@ -128,8 +135,13 @@ function blue(text: string): string {
 	return `\x1b[38;5;39m${text}\x1b[39m`;
 }
 
-function styleContextPercent(theme: Theme, percent: number | null): string {
-	const label = percent === null ? "?" : `${Math.round(percent)}%`;
+function formatTokensK(tokens: number | null): string {
+	if (tokens === null) return "?k";
+	return `${Math.round(tokens / 1000)}k`;
+}
+
+function styleContextUsage(theme: Theme, percent: number | null, tokens: number | null, contextWindow: number | null): string {
+	const label = `${percent === null ? "?" : `${Math.round(percent)}%`} ${formatTokensK(tokens)}/${formatTokensK(contextWindow)}`;
 
 	if (percent === null) return theme.fg("dim", label);
 	if (percent >= 90) return theme.fg("error", theme.bold(label));
@@ -270,7 +282,10 @@ function syncRuntimeState(pi: ExtensionAPI, ctx: ExtensionContext): void {
 		reasoning: ctx.model?.reasoning,
 	};
 	runtimeState.currentDirectory = getCurrentDirectoryName(ctx.sessionManager.getCwd());
-	runtimeState.contextPercent = ctx.getContextUsage()?.percent ?? null;
+	const contextUsage = ctx.getContextUsage();
+	runtimeState.contextPercent = contextUsage?.percent ?? null;
+	runtimeState.contextTokens = contextUsage?.tokens ?? null;
+	runtimeState.contextWindow = contextUsage?.contextWindow ?? null;
 	runtimeState.openRouterTotalCost = getTotalAssistantCost(ctx);
 	runtimeState.thinkingLevel = ctx.model?.reasoning ? pi.getThinkingLevel() : "off";
 }
@@ -279,6 +294,8 @@ function clearRuntimeState(): void {
 	runtimeState.currentModel = {};
 	runtimeState.currentDirectory = "?";
 	runtimeState.contextPercent = null;
+	runtimeState.contextTokens = null;
+	runtimeState.contextWindow = null;
 	runtimeState.openRouterTotalCost = 0;
 	runtimeState.thinkingLevel = "off";
 }
@@ -477,13 +494,14 @@ function buildFooterLine(theme: Theme, branch: string | null, statuses: FooterSt
 
 	const segments = [
 		`${theme.fg("dim", "⌂ ")}${theme.fg("accent", theme.bold(runtimeState.currentDirectory))}`,
-		branch ? `${theme.fg("dim", "⎇ ")}${theme.fg("success", truncateToWidth(branch, 24, "…"))}` : "",
-		styleContextPercent(theme, runtimeState.contextPercent),
-		blue(provider),
+		branch ? `${theme.fg("dim", "⎇ ")}${theme.fg("dim", truncateToWidth(branch, 24, "…"))}` : "",
+		styleContextUsage(theme, runtimeState.contextPercent, runtimeState.contextTokens, runtimeState.contextWindow),
+		theme.fg("dim", provider),
 		theme.bold(model),
 		theme.fg(getThinkingColor(runtimeState.thinkingLevel), theme.bold(runtimeState.thinkingLevel)),
 		openRouterCostSegment,
 		codexQuotaSegment,
+		statuses.sandboxActive ? theme.fg("accent", "🔒") : "",
 		...statuses.others,
 	];
 

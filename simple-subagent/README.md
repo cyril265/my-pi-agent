@@ -2,7 +2,7 @@
 
 Tiny pi extension. Adds one tool:
 
-- `runSubAgents({ agents: [{ name, thinking, prompt, cwd }] })` writes results to `/tmp/<random-id>/<name>-result.md`
+- `runSubAgents({ agents: [{ name, thinking, prompt, cwd, sessionKey? }] })` returns result file paths
 
 ## Install
 
@@ -23,7 +23,13 @@ Then reload:
 - `prompt`: prompt sent to child pi process
 - `cwd`: working directory for child pi run
 
-Tool runs separate `pi` process in JSON mode with `--no-session`.
+Tool runs separate `pi` process in JSON mode.
+
+Session behavior:
+
+- omit `sessionKey`: ephemeral child run with `--no-session`
+- set `sessionKey`: reusable child session at `<cwd>/.pi/subagents/<sessionKey>.jsonl`
+- do not run the same `cwd + sessionKey` twice in one parallel call
 
 `/runSubAgent` opens split in `cmux`, `tmux`, or Warp, depending on current session.
 

@@ -83,6 +83,12 @@ function sanitizeFileName(name: string): string {
   return sanitized;
 }
 
+function getSubagentSessionPath(cwd: string, sessionKey: string): string {
+  const sessionDirectory = path.join(cwd, ".pi", "subagents");
+  fs.mkdirSync(sessionDirectory, { recursive: true });
+  return path.join(sessionDirectory, `${sanitizeFileName(sessionKey)}.jsonl`);
+}
+
 async function runPiJsonProcess(
   args: string[],
   cwd: string,
@@ -273,11 +279,13 @@ async function runSubAgent(
   thinking: ThinkingLevel,
   prompt: string,
   cwd: string,
+  sessionKey: string | undefined,
   signal: AbortSignal | undefined,
   onUpdate: ((text: string) => void) | undefined,
 ): Promise<{ text: string; exitCode: number }> {
   const messages: Message[] = [];
-  const args = ["--mode", "json", "-p", "--no-session", "--model", model, "--thinking", thinking, getPromptArgument(prompt)];
+  const sessionArgs = sessionKey ? ["--session", getSubagentSessionPath(cwd, sessionKey)] : ["--no-session"];
+  const args = ["--mode", "json", "-p", ...sessionArgs, "--model", model, "--thinking", thinking, getPromptArgument(prompt)];
 
   const result = await runPiJsonProcess(args, cwd, signal, (event) => {
     if (event.type !== "message_end" || !event.message) return;
@@ -330,13 +338,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "runSubAgents",
-    description: "Run multiple independent subagents in parallel. Each subagent writes its result to /tmp/<random-id>/<name>-result.md.",
+    description: "Run subagents. sessionKey reuses context. Returns result file paths. Valid thinking values: low|medium|high|xhigh",
     parameters: Type.Object({
       agents: Type.Array(
         Type.Object({
           thinking: Type.Union([
-            Type.Literal("off"),
-            Type.Literal("minimal"),
             Type.Literal("low"),
             Type.Literal("medium"),
             Type.Literal("high"),
@@ -345,6 +351,7 @@ export default function (pi: ExtensionAPI) {
           name: Type.String(),
           prompt: Type.String(),
           cwd: Type.String(),
+          sessionKey: Type.Optional(Type.String()),
         }),
       ),
     }),
@@ -356,7 +363,10 @@ export default function (pi: ExtensionAPI) {
         theme.fg(
           "toolOutput",
           args.agents
-            .map((agent, index) => `${index + 1}. ${agent.name} - ${getCwdLabel(agent.cwd)} - ${truncate(agent.prompt, 120)}`)
+            .map((agent) => {
+              const session = agent.sessionKey ? ` - session:${agent.sessionKey}` : "";
+              return `${agent.name} - thinking:${agent.thinking}${session} - ${getCwdLabel(agent.cwd)}\n${truncate(agent.prompt, 500)}`;
+            })
             .join("\n"),
         ),
       ].join("");
@@ -373,14 +383,20 @@ export default function (pi: ExtensionAPI) {
       if (params.agents.length === 0) throw new Error("No agents");
 
       const runDirectory = createRunDirectory();
+      const sessionPaths = params.agents.flatMap((agent) =>
+        agent.sessionKey ? [getSubagentSessionPath(agent.cwd, agent.sessionKey)] : [],
+      );
+      if (new Set(sessionPaths).size !== sessionPaths.length) {
+        throw new Error("Duplicate subagent sessionKey for same cwd in one parallel run");
+      }
 
       const results = await Promise.all(
         params.agents.map(async (agent, index) => {
-          const result = await runSubAgent(model, agent.thinking, agent.prompt, agent.cwd, signal, undefined);
+          const result = await runSubAgent(model, agent.thinking, agent.prompt, agent.cwd, agent.sessionKey, signal, undefined);
           const outputPath = path.join(runDirectory, `${sanitizeFileName(agent.name)}-result.md`);
           fs.writeFileSync(outputPath, result.text);
           onUpdate?.({
-            content: [{ type: "text", text: `Agent ${index + 1} done: ${outputPath}` }],
+            content: [{ type: "text", text: `${agent.name} done (${agent.thinking}): ${outputPath}` }],
           });
           return { index, outputPath, result };
         }),
@@ -388,7 +404,7 @@ export default function (pi: ExtensionAPI) {
 
       const text = results
         .sort((a, b) => a.index - b.index)
-        .map(({ index, outputPath, result }) => `${params.agents[index].name} (exit ${result.exitCode}): ${outputPath}`)
+        .map(({ index, outputPath, result }) => `${params.agents[index].name} (${params.agents[index].thinking}, exit ${result.exitCode}): ${outputPath}`)
         .join("\n");
 
       return {
