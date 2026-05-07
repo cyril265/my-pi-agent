@@ -511,21 +511,21 @@ function createReviewWindowData(
 ): ReviewWindowData {
   if (mode === "last-turn") {
     return {
-      title: "Last turn review",
+      title: "Diff turn",
       repoRoot,
       mode,
-      scopeLabel: "last turn",
-      scopeHint: "Review changes from the latest agent turn with reviewable changes. Hover or click line numbers in the gutter to add an inline comment.",
+      scopeLabel: "turn diff",
+      scopeHint: "Review the latest agent turn diff. Hover or click line numbers in the gutter to add an inline comment.",
       theme,
       files,
     };
   }
 
   return {
-    title: "Git changes review",
+    title: "Diff git",
     repoRoot,
     mode,
-    scopeLabel: "current Git changes",
+    scopeLabel: "git diff",
     scopeHint: "Review current Git working-tree changes against HEAD. Hover or click line numbers in the gutter to add an inline comment.",
     theme,
     files,
@@ -883,8 +883,8 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.registerCommand("last-turn-review", {
-    description: "Review the exact file diff from the latest agent turn with reviewable changes",
+  pi.registerCommand("diff-turn", {
+    description: "Open the Glimpse diff review window for the latest agent turn", 
     handler: async (_args, ctx) => {
       if (activeWindow != null) {
         ctx.ui.notify("A review window is already open.", "warning");
@@ -944,7 +944,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("undo-last-turn", {
+  pi.registerCommand("undo-turn", {
     description: "Undo the exact worktree changes from the latest agent turn with reviewable changes",
     handler: async (_args, ctx) => {
       await restoreLatestChangedTurn(ctx);
@@ -1009,8 +1009,8 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("git-changes-review", {
-    description: "Review current Git working-tree changes",
+  pi.registerCommand("diff-git", {
+    description: "Open the Glimpse diff review window for current Git changes",
     handler: async (_args, ctx) => {
       if (activeWindow != null) {
         ctx.ui.notify("A review window is already open.", "warning");
