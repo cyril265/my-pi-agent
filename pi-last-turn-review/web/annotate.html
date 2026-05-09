@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full bg-review-bg">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>pi annotate</title>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style type="text/tailwindcss">
+  @theme {
+    --color-review-bg: #0b1020;
+    --color-review-panel: #111827;
+    --color-review-hover: #1f2937;
+    --color-review-border: #263244;
+    --color-review-text: #e5e7eb;
+    --color-review-strong: #f8fafc;
+    --color-review-muted: #9ca3af;
+    --color-review-accent: #60a5fa;
+    --color-review-success: #34d399;
+    --color-review-error: #fb7185;
+  }
+</style>
+<style>
+  html, body { width: 100%; height: 100%; overflow: hidden; }
+  #editor-container { height: 100%; min-height: 0; overflow: hidden; }
+  #editor-container > div, #editor-container .monaco-editor { height: 100% !important; }
+  .monaco-editor .view-zones { z-index: 10; }
+  .view-zone-container {
+    padding: 8px 16px 10px 16px;
+    border-top: 1px solid var(--color-review-border, #30363d);
+    border-bottom: 1px solid var(--color-review-border, #30363d);
+    background: var(--color-review-panel, #161b22);
+    overflow: visible;
+  }
+  .review-modal-backdrop {
+    position: fixed; inset: 0;
+    background: color-mix(in srgb, var(--color-review-bg, #010409) 86%, transparent);
+    backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100;
+  }
+  .review-modal-card {
+    width: min(760px, 92vw);
+    background: var(--color-review-panel, #161b22);
+    border: 1px solid var(--color-review-border, #30363d);
+    border-radius: 12px;
+    box-shadow: 0 16px 64px rgba(0, 0, 0, 0.5);
+    padding: 24px;
+  }
+  .monaco-editor .annotate-comment-line { background: rgba(88, 166, 255, 0.15); }
+  .monaco-editor .annotate-comment-glyph {
+    border-radius: 999px;
+    width: 8px !important;
+    height: 8px !important;
+    margin-left: 6px;
+    margin-top: 5px;
+    cursor: pointer;
+    background: var(--color-review-accent, #58a6ff);
+  }
+  .monaco-editor .annotate-glyph-plus {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' width='16' height='16'%3E%3Cpath fill='%23c9d1d9' d='M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z'%3E%3C/path%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: 12px;
+    background-color: var(--color-review-success, #238636);
+    border-radius: 4px;
+    cursor: pointer;
+    margin-left: 2px;
+    margin-top: 2px;
+    width: 16px !important;
+    height: 16px !important;
+  }
+</style>
+</head>
+<body class="h-full overflow-hidden bg-review-bg text-review-text antialiased">
+<div class="flex h-full w-full flex-col">
+  <div class="flex items-center justify-between gap-4 border-b border-review-border bg-review-bg px-4 py-3">
+    <div class="min-w-0">
+      <div id="window-title" class="text-[15px] font-semibold text-review-strong">Annotate turn</div>
+      <div id="source-hint" class="truncate text-[11px] text-review-muted"></div>
+    </div>
+    <div class="flex items-center gap-2">
+      <div id="summary" class="max-w-[24rem] truncate text-[11px] text-review-muted"></div>
+      <button id="overall-comment-button" class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1.5 text-xs font-medium text-review-text hover:bg-review-hover">Overall note</button>
+      <button id="copy-button" class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1.5 text-xs font-medium text-review-text hover:bg-review-hover">Copy text</button>
+      <button id="toggle-wrap-button" class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1.5 text-xs font-medium text-review-text hover:bg-review-hover">Wrap lines: on</button>
+      <button id="cancel-button" class="cursor-pointer rounded-md border border-review-border bg-review-panel px-3 py-1.5 text-xs font-medium text-review-text hover:bg-review-error/10 hover:text-review-error hover:border-review-error/30">Cancel</button>
+      <button id="submit-button" disabled class="cursor-pointer rounded-md border border-review-border bg-review-success px-3 py-1.5 text-xs font-medium text-white hover:opacity-90 disabled:cursor-default disabled:opacity-50">Finish annotation</button>
+    </div>
+  </div>
+  <div id="editor-container" class="min-h-0 min-w-0 flex-1"></div>
+</div>
+
+<script id="annotate-data" type="application/json">__INLINE_DATA__</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
+<script>
+__INLINE_JS__
+</script>
+</body>
+</html>

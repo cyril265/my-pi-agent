@@ -36,7 +36,9 @@ type WarpPayload = {
 
 let sessionId = `pi-${process.pid}-${Date.now()}`;
 let lastPrompt = "Pi task";
+let pendingPrompt = "Pi task";
 let sessionStarted = false;
+let agentRunning = false;
 
 function oscSafe(value: string): string {
   return value.replace(/[\x00-\x1f\x7f]/g, " ").replace(/;/g, ",").trim();
@@ -79,20 +81,26 @@ function ensureSessionStarted(ctx?: ExtensionContext): void {
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (_event, _ctx) => {
     sessionId = `pi-${process.pid}-${Date.now()}`;
     sessionStarted = false;
-    ensureSessionStarted(ctx);
+    agentRunning = false;
   });
 
-  pi.on("before_agent_start", async (event, ctx) => {
+  pi.on("before_agent_start", async (event) => {
+    pendingPrompt = event.prompt.trim() || "Pi task";
+  });
+
+  pi.on("agent_start", async (_event, ctx) => {
     ensureSessionStarted(ctx);
-    lastPrompt = event.prompt.trim() || "Pi task";
+    agentRunning = true;
+    lastPrompt = pendingPrompt;
     sendWarpEvent("prompt_submit", { query: lastPrompt }, ctx);
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    ensureSessionStarted(ctx);
+    if (!agentRunning) return;
+    agentRunning = false;
     sendWarpEvent(
       "stop",
       {

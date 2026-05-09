@@ -61,6 +61,42 @@ export interface ReviewRequestFilePayload {
 
 export type ReviewWindowMessage = ReviewSubmitPayload | ReviewCancelPayload | ReviewRendererErrorPayload | ReviewRequestFilePayload;
 
+export interface AnnotateComment {
+  id: string;
+  line: number;
+  body: string;
+}
+
+export interface AnnotateSubmitPayload {
+  type: "submit";
+  overallComment: string;
+  comments: AnnotateComment[];
+}
+
+export interface AnnotateCancelPayload {
+  type: "cancel";
+}
+
+export interface AnnotateRendererErrorPayload {
+  type: "renderer-error";
+  message: string;
+}
+
+export interface AnnotateCopyTextPayload {
+  type: "copy-text";
+  text: string;
+}
+
+export type AnnotateWindowMessage = AnnotateSubmitPayload | AnnotateCancelPayload | AnnotateRendererErrorPayload | AnnotateCopyTextPayload;
+
+export interface AnnotateWindowData {
+  title: string;
+  sourceLabel: string;
+  sourceHint: string;
+  text: string;
+  theme: ReviewTheme;
+}
+
 export interface ReviewFileDataMessage {
   type: "file-data";
   requestId: string;

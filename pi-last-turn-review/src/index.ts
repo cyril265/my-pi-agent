@@ -1,4 +1,4 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { lstat, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
@@ -15,6 +15,12 @@ import {
 } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
 import type {
+  AnnotateCancelPayload,
+  AnnotateCopyTextPayload,
+  AnnotateRendererErrorPayload,
+  AnnotateSubmitPayload,
+  AnnotateWindowData,
+  AnnotateWindowMessage,
   ReviewCancelPayload,
   ReviewFile,
   ReviewFileContents,
@@ -27,7 +33,7 @@ import type {
   ReviewWindowData,
   ReviewWindowMessage,
 } from "./types.js";
-import { buildReviewHtml } from "./ui.js";
+import { buildAnnotateHtml, buildReviewHtml } from "./ui.js";
 
 const execFile = promisify(execFileCallback);
 const STORE_REF_PREFIX = "refs/pi-last-turn-review/sessions";
@@ -70,6 +76,7 @@ interface ReviewSession {
   loadContents(file: ReviewFile): Promise<ReviewFileContents>;
 }
 
+
 function isSubmitPayload(value: ReviewWindowMessage): value is ReviewSubmitPayload {
   return value.type === "submit";
 }
@@ -84,6 +91,22 @@ function isRequestFilePayload(value: ReviewWindowMessage): value is ReviewReques
 
 function isRendererErrorPayload(value: ReviewWindowMessage): value is ReviewRendererErrorPayload {
   return value.type === "renderer-error";
+}
+
+function isAnnotateSubmitPayload(value: AnnotateWindowMessage): value is AnnotateSubmitPayload {
+  return value.type === "submit";
+}
+
+function isAnnotateCancelPayload(value: AnnotateWindowMessage): value is AnnotateCancelPayload {
+  return value.type === "cancel";
+}
+
+function isAnnotateRendererErrorPayload(value: AnnotateWindowMessage): value is AnnotateRendererErrorPayload {
+  return value.type === "renderer-error";
+}
+
+function isAnnotateCopyTextPayload(value: AnnotateWindowMessage): value is AnnotateCopyTextPayload {
+  return value.type === "copy-text";
 }
 
 type WaitingEditorResult = "escape" | "window-settled";
@@ -120,6 +143,42 @@ async function execGitChecked(repoRoot: string, args: string[], env?: NodeJS.Pro
 async function execGitRaw(repoRoot: string, args: string[], env?: NodeJS.ProcessEnv): Promise<string> {
   const result = await execFile("git", args, { cwd: repoRoot, env });
   return String(result.stdout);
+}
+
+async function writeClipboard(text: string): Promise<void> {
+  const commands = process.platform === "darwin"
+    ? [["pbcopy"]]
+    : process.platform === "win32"
+      ? [["clip.exe"]]
+      : [["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]];
+
+  let lastError: unknown;
+  for (const [command, ...args] of commands) {
+    try {
+      await new Promise<void>((resolvePromise, reject) => {
+        const child = spawn(command, args);
+        let stderr = "";
+        child.stderr?.on("data", (chunk) => {
+          stderr += String(chunk);
+        });
+        child.on("error", reject);
+        child.on("close", (code) => {
+          if (code === 0) {
+            resolvePromise();
+          } else {
+            reject(new Error(stderr.trim() || `${command} exited with code ${code}`));
+          }
+        });
+        child.stdin.end(text);
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const message = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`Clipboard copy failed: ${message}`);
 }
 
 async function gitCommitExists(repoRoot: string, commit: string): Promise<boolean> {
@@ -503,6 +562,68 @@ function buildReviewTheme(theme: ExtensionContext["ui"]["theme"]): ReviewTheme {
   return relativeLuminance(piBackground) > 0.45 ? LIGHT_REVIEW_THEME : DARK_REVIEW_THEME;
 }
 
+function createAnnotateWindowData(text: string, theme: ReviewTheme): AnnotateWindowData {
+  return {
+    title: "Annotate turn",
+    sourceLabel: "latest response",
+    sourceHint: "Annotate the final assistant response from the latest agent turn. Hover or click line numbers in the gutter to add an inline comment.",
+    text,
+    theme,
+  };
+}
+
+function extractTextContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .filter((block): block is { type: string; text: string } => {
+      return typeof block === "object" && block != null && "type" in block && "text" in block
+        && block.type === "text" && typeof block.text === "string";
+    })
+    .map((block) => block.text)
+    .join("\n\n")
+    .trim();
+}
+
+function getFinalAssistantResponseFromBranch(branch: unknown[]): string | null {
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index];
+    if (typeof entry !== "object" || entry == null || !("type" in entry) || entry.type !== "message" || !("message" in entry)) continue;
+
+    const message = entry.message;
+    if (typeof message !== "object" || message == null || !("role" in message) || message.role !== "assistant") continue;
+
+    const text = extractTextContent("content" in message ? message.content : undefined);
+    if (text.length > 0) return text;
+  }
+
+  return null;
+}
+
+function composeAnnotatePrompt(sourceText: string, payload: AnnotateSubmitPayload): string {
+  const sourceLines = sourceText.split("\n");
+  const comments = [...payload.comments].sort((a, b) => a.line - b.line);
+  const lines: string[] = ["Address this feedback:", ""];
+
+  const overallComment = payload.overallComment.trim();
+  if (overallComment.length > 0) {
+    lines.push(`Overall: ${overallComment}`);
+  }
+
+  comments.forEach((comment) => {
+    const sourceLine = sourceLines[comment.line - 1]?.trim();
+    if (sourceLine != null && sourceLine.length > 0) {
+      lines.push(`"${sourceLine}"`);
+    } else {
+      lines.push(`Line ${comment.line}`);
+    }
+    lines.push(`- ${comment.body.trim()}`);
+  });
+
+  return lines.join("\n").trim();
+}
+
 function createReviewWindowData(
   mode: ReviewMode,
   repoRoot: string,
@@ -781,6 +902,113 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function openAnnotateWindow(ctx: ExtensionCommandContext, data: AnnotateWindowData): Promise<void> {
+    if (!ctx.hasUI) {
+      ctx.ui.notify("Annotation window requires interactive UI.", "warning");
+      return;
+    }
+
+    if (activeWindow != null) {
+      ctx.ui.notify("A review window is already open.", "warning");
+      return;
+    }
+
+    try {
+      const html = buildAnnotateHtml(data);
+      const window = open(html, {
+        width: 1320,
+        height: 920,
+        title: data.title,
+      });
+      activeWindow = window;
+
+      const waitingUI = showWaitingUI(ctx);
+      const terminalMessagePromise = new Promise<AnnotateSubmitPayload | AnnotateCancelPayload | null>((resolve, reject) => {
+        let settled = false;
+
+        const cleanup = (clearActiveWindow: boolean): void => {
+          window.removeListener("message", onMessage);
+          window.removeListener("closed", onClosed);
+          window.removeListener("error", onError);
+          if (clearActiveWindow && activeWindow === window) {
+            activeWindow = null;
+          }
+        };
+
+        const settle = (value: AnnotateSubmitPayload | AnnotateCancelPayload | null): void => {
+          if (settled) return;
+          settled = true;
+          cleanup(false);
+          resolve(value);
+        };
+
+        const onMessage = (data: unknown): void => {
+          const message = data as AnnotateWindowMessage;
+          if (isAnnotateRendererErrorPayload(message)) {
+            cleanup(true);
+            reject(new Error(message.message || "Annotation renderer failed."));
+            return;
+          }
+
+          if (isAnnotateCopyTextPayload(message)) {
+            void writeClipboard(message.text).catch((error) => {
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              ctx.ui.notify(errorMessage, "warning");
+            });
+            return;
+          }
+
+          if (isAnnotateSubmitPayload(message) || isAnnotateCancelPayload(message)) {
+            settle(message);
+          }
+        };
+
+        const onClosed = (): void => settle(null);
+        const onError = (error: Error): void => {
+          cleanup(true);
+          reject(error);
+        };
+
+        window.on("message", onMessage);
+        window.on("closed", onClosed);
+        window.on("error", onError);
+      });
+
+      ctx.ui.notify("Opened native annotation window.", "info");
+      const result = await Promise.race([
+        terminalMessagePromise.then((message) => ({ type: "window" as const, message })),
+        waitingUI.promise.then((reason) => ({ type: "ui" as const, reason })),
+      ]);
+
+      if (result.type === "ui" && result.reason === "escape") {
+        closeActiveWindow();
+        await terminalMessagePromise.catch(() => null);
+        ctx.ui.notify("Annotation cancelled.", "info");
+        return;
+      }
+
+      const message = result.type === "window" ? result.message : await terminalMessagePromise;
+
+      waitingUI.dismiss();
+      await waitingUI.promise;
+      closeActiveWindow();
+
+      if (message == null || message.type === "cancel") {
+        ctx.ui.notify("Annotation cancelled.", "info");
+        return;
+      }
+
+      const prompt = composeAnnotatePrompt(data.text, message);
+      ctx.ui.setEditorText(prompt);
+      ctx.ui.notify("Inserted annotation feedback into the editor.", "info");
+    } catch (error) {
+      activeWaitingUIDismiss?.();
+      closeActiveWindow();
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Annotation failed: ${message}`, "error");
+    }
+  }
+
   function toPersistedSnapshot(snapshot: TurnSnapshot): PersistedTurnSnapshot {
     return {
       v: 1,
@@ -884,7 +1112,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("diff-turn", {
-    description: "Open the Glimpse diff review window for the latest agent turn", 
+    description: "Open the Glimpse diff review window for the latest agent turn",
     handler: async (_args, ctx) => {
       if (activeWindow != null) {
         ctx.ui.notify("A review window is already open.", "warning");
@@ -941,6 +1169,24 @@ export default function (pi: ExtensionAPI) {
           file,
         ),
       });
+    },
+  });
+
+  pi.registerCommand("annotate-turn", {
+    description: "Open the Glimpse annotation window for the latest assistant response",
+    handler: async (_args, ctx) => {
+      if (activeWindow != null) {
+        ctx.ui.notify("A review window is already open.", "warning");
+        return;
+      }
+
+      const latestAssistantResponse = getFinalAssistantResponseFromBranch(ctx.sessionManager.getBranch());
+      if (latestAssistantResponse == null) {
+        ctx.ui.notify("No latest assistant response is available to annotate.", "info");
+        return;
+      }
+
+      await openAnnotateWindow(ctx, createAnnotateWindowData(latestAssistantResponse, buildReviewTheme(ctx.ui.theme)));
     },
   });
 
