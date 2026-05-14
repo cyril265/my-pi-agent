@@ -1,5 +1,9 @@
 {
   "name": "pi-preset-extension",
   "private": true,
-  "main": "./index.ts"
+  "main": "./index.ts",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
 }

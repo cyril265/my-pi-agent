@@ -1,6 +1,6 @@
 import { Queue, mergeMetadata, resolveQueuePath } from "../../../sq-node/dist/index.js";
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { Message } from "@mariozechner/pi-ai";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { Message } from "@earendil-works/pi-ai";
 const MAX_TODO_TEXT_CHARS = 2400;
 const MAX_TODO_SUMMARY_CHARS = 8000;
 

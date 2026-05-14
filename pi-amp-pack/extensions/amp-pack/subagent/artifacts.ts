@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Message } from "@mariozechner/pi-ai";
+import type { Message } from "@earendil-works/pi-ai";
 import { Queue, mergeMetadata, resolveQueuePath } from "../../../sq-node/dist/index.js";
 
 export type SubagentMode = "single" | "parallel" | "chain";

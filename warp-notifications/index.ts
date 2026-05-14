@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const EXTENSION_VERSION = "0.1.0";
 const WARP_SENTINEL_TITLE = "warp://cli-agent";

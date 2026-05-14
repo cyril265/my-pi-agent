@@ -4,7 +4,7 @@
   "defaultModel": "gpt-5.4",
   "defaultThinkingLevel": "medium",
   "packages": [
-    "npm:@mariozechner/pi-ai",
+    "npm:@earendil-works/pi-ai",
     "npm:pi-ghostty",
     "https://github.com/ogulcancelik/pi-ghostty-theme-sync",
     "npm:pi-mcp-adapter",

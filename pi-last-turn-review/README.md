@@ -4,11 +4,14 @@ A tiny pi package for reviewing what just changed before you keep going.
 
 ## Install
 
+This repository contains multiple pi packages, so install this package from a checkout:
+
 ```sh
-pi install git:https://github.com/cyril265/my-pi-agent
+npm --prefix pi-last-turn-review install
+pi install ./pi-last-turn-review
 ```
 
-Git installs run dependency installation from the repository root, so users do not need to run `npm install` first. Local path installs still use the checkout as-is; run `npm install` for local development.
+A one-command Git install for this package requires publishing it separately or moving it to its own repository.
 
 ## What it does
 

@@ -714,7 +714,7 @@ function matchesPackage(inputValue: string, manifest: Manifest) {
 }
 
 function isPiAiPackage(packageName: string) {
-  return packageName === "pi-ai" || packageName === "@mariozechner/pi-ai" || packageName.endsWith("/pi-ai");
+  return packageName === "pi-ai" || packageName === "@earendil-works/pi-ai" || packageName.endsWith("/pi-ai");
 }
 
 function removeOriginalInstall(scope: Scope, source: Exclude<ParsedSource, { kind: "local" }>) {

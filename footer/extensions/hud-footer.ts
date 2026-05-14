@@ -1,7 +1,7 @@
 import { basename } from "node:path";
 
-import type { ExtensionAPI, ExtensionContext, Theme } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { formatUsageStatus } from "@marckrenn/pi-sub-bar/src/formatting.js";
 import { loadSettings as loadSubBarSettings } from "@marckrenn/pi-sub-bar/src/settings.js";
 import type { RateWindow, UsageError, UsageSnapshot } from "@marckrenn/pi-sub-bar/src/types.js";

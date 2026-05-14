@@ -4,5 +4,8 @@
   "private": true,
   "type": "module",
   "main": "index.ts",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "dependencies": {}
 }
