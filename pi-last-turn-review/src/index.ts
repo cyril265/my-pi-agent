@@ -22,6 +22,7 @@ import type {
   AnnotateWindowData,
   AnnotateWindowMessage,
   ReviewCancelPayload,
+  ReviewCopyTextPayload,
   ReviewFile,
   ReviewFileContents,
   ReviewHostMessage,
@@ -83,6 +84,10 @@ function isSubmitPayload(value: ReviewWindowMessage): value is ReviewSubmitPaylo
 
 function isCancelPayload(value: ReviewWindowMessage): value is ReviewCancelPayload {
   return value.type === "cancel";
+}
+
+function isReviewCopyTextPayload(value: ReviewWindowMessage): value is ReviewCopyTextPayload {
+  return value.type === "copy-text";
 }
 
 function isRequestFilePayload(value: ReviewWindowMessage): value is ReviewRequestFilePayload {
@@ -624,6 +629,10 @@ function composeAnnotatePrompt(sourceText: string, payload: AnnotateSubmitPayloa
   return lines.join("\n").trim();
 }
 
+function shouldUseTopmostNativeWindow(): boolean {
+  return process.platform === "win32";
+}
+
 function createReviewWindowData(
   mode: ReviewMode,
   repoRoot: string,
@@ -654,9 +663,9 @@ function createReviewWindowData(
 }
 
 export default function (pi: ExtensionAPI) {
-  let activePromptText: string | null = null;
-  let activeTurnBefore: ActiveTurnBefore | null = null;
-  let latestChangedTurn: TurnSnapshot | null = null;
+  const activePromptTextBySession = new Map<string, string>();
+  const activeTurnBeforeBySession = new Map<string, ActiveTurnBefore>();
+  const latestChangedTurnBySession = new Map<string, TurnSnapshot>();
   let activeWindow: GlimpseWindow | null = null;
   let activeWaitingUIDismiss: (() => void) | null = null;
 
@@ -754,6 +763,7 @@ export default function (pi: ExtensionAPI) {
         width: 1680,
         height: 1020,
         title: session.data.title,
+        ...(shouldUseTopmostNativeWindow() ? { floating: true } : {}),
       });
       activeWindow = window;
 
@@ -844,6 +854,13 @@ export default function (pi: ExtensionAPI) {
             void handleRequestFile(message);
             return;
           }
+          if (isReviewCopyTextPayload(message)) {
+            void writeClipboard(message.text).catch((error) => {
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              ctx.ui.notify(errorMessage, "warning");
+            });
+            return;
+          }
           if (isSubmitPayload(message) || isCancelPayload(message)) {
             settle(message);
           }
@@ -919,6 +936,7 @@ export default function (pi: ExtensionAPI) {
         width: 1320,
         height: 920,
         title: data.title,
+        ...(shouldUseTopmostNativeWindow() ? { floating: true } : {}),
       });
       activeWindow = window;
 
@@ -1025,7 +1043,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function restoreLatestChangedTurn(ctx: ExtensionContext): Promise<void> {
-    latestChangedTurn = null;
+    const sessionId = ctx.sessionManager.getSessionId();
+    latestChangedTurnBySession.delete(sessionId);
 
     const branch = ctx.sessionManager.getBranch();
     for (let index = branch.length - 1; index >= 0; index -= 1) {
@@ -1037,8 +1056,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (await gitCommitExists(entry.data.repoRoot, entry.data.beforeCommit) && await gitCommitExists(entry.data.repoRoot, entry.data.afterCommit)) {
-        await keepLatestSnapshotPair(entry.data.repoRoot, ctx.sessionManager.getSessionId(), entry.data.beforeCommit, entry.data.afterCommit);
-        latestChangedTurn = toTurnSnapshot(entry.data);
+        await keepLatestSnapshotPair(entry.data.repoRoot, sessionId, entry.data.beforeCommit, entry.data.afterCommit);
+        latestChangedTurnBySession.set(sessionId, toTurnSnapshot(entry.data));
         break;
       }
     }
@@ -1052,31 +1071,34 @@ export default function (pi: ExtensionAPI) {
     await restoreLatestChangedTurn(ctx);
   });
 
-  pi.on("before_agent_start", async (event) => {
-    activePromptText = event.prompt;
+  pi.on("before_agent_start", async (event, ctx) => {
+    activePromptTextBySession.set(ctx.sessionManager.getSessionId(), event.prompt);
   });
 
   pi.on("turn_start", async (event, ctx) => {
     if (event.turnIndex !== 0) return;
 
-    activeTurnBefore = null;
+    const sessionId = ctx.sessionManager.getSessionId();
+    activeTurnBeforeBySession.delete(sessionId);
 
     try {
       const repoRoot = await getRepoRoot(pi, ctx.cwd);
       const tree = await captureWorktreeTree(repoRoot);
-      activeTurnBefore = {
+      activeTurnBeforeBySession.set(sessionId, {
         repoRoot,
         tree,
-        prompt: activePromptText ?? undefined,
-      };
+        prompt: activePromptTextBySession.get(sessionId),
+      });
     } catch {
-      activeTurnBefore = null;
+      activeTurnBeforeBySession.delete(sessionId);
     }
   });
 
   pi.on("agent_end", async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const activeTurnBefore = activeTurnBeforeBySession.get(sessionId);
     if (activeTurnBefore == null) {
-      activePromptText = null;
+      activePromptTextBySession.delete(sessionId);
       return;
     }
 
@@ -1087,7 +1109,7 @@ export default function (pi: ExtensionAPI) {
         if (files.length > 0) {
           const beforeCommit = await createSnapshotCommit(activeTurnBefore.repoRoot, activeTurnBefore.tree);
           const afterCommit = await createSnapshotCommit(activeTurnBefore.repoRoot, afterTree);
-          await keepLatestSnapshotPair(activeTurnBefore.repoRoot, ctx.sessionManager.getSessionId(), beforeCommit, afterCommit);
+          await keepLatestSnapshotPair(activeTurnBefore.repoRoot, sessionId, beforeCommit, afterCommit);
 
           const data: PersistedTurnSnapshot = {
             v: 1,
@@ -1098,16 +1120,17 @@ export default function (pi: ExtensionAPI) {
             completedAt: new Date().toISOString(),
           };
 
-          latestChangedTurn = toTurnSnapshot(data);
-          appendSnapshotEntry(latestChangedTurn);
+          const snapshot = toTurnSnapshot(data);
+          latestChangedTurnBySession.set(sessionId, snapshot);
+          appendSnapshotEntry(snapshot);
         }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(`Failed to persist last-turn review snapshot: ${message}`, "warning");
     } finally {
-      activeTurnBefore = null;
-      activePromptText = null;
+      activeTurnBeforeBySession.delete(sessionId);
+      activePromptTextBySession.delete(sessionId);
     }
   });
 
@@ -1119,7 +1142,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const snapshot = latestChangedTurn;
+      const snapshot = latestChangedTurnBySession.get(ctx.sessionManager.getSessionId()) ?? null;
       if (snapshot == null) {
         ctx.ui.notify("No changed last-turn Git snapshot is available.", "info");
         return;
@@ -1195,7 +1218,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       await restoreLatestChangedTurn(ctx);
 
-      const snapshot = latestChangedTurn;
+      const snapshot = latestChangedTurnBySession.get(ctx.sessionManager.getSessionId()) ?? null;
       if (snapshot == null) {
         ctx.ui.notify("No changed last-turn Git snapshot is available.", "info");
         return;
@@ -1245,7 +1268,7 @@ export default function (pi: ExtensionAPI) {
           afterCommit: snapshot.afterTree,
           undoneAt: new Date().toISOString(),
         });
-        latestChangedTurn = null;
+        latestChangedTurnBySession.delete(ctx.sessionManager.getSessionId());
         await deleteLatestSnapshotPairRef(snapshot.repoRoot, ctx.sessionManager.getSessionId()).catch(() => {});
         ctx.ui.notify(`Undid latest changed agent turn (${undoneCount} changed path(s)).`, "info");
       } catch (error) {
@@ -1294,7 +1317,11 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    activePromptTextBySession.delete(sessionId);
+    activeTurnBeforeBySession.delete(sessionId);
+    latestChangedTurnBySession.delete(sessionId);
     activeWaitingUIDismiss?.();
     closeActiveWindow();
   });

@@ -73,10 +73,23 @@ function hasSubmittableFeedback() {
 }
 
 function selectedText() {
-  if (!editor) return "";
+  if (!editor?.hasTextFocus?.()) return "";
   const selection = editor.getSelection();
-  if (!selection || selection.isEmpty()) return "";
-  return editor.getModel().getValueInRange(selection);
+  const model = editor.getModel();
+  if (!selection || selection.isEmpty() || !model) return "";
+  return model.getValueInRange(selection);
+}
+
+function isEditableElement(element) {
+  if (!(element instanceof HTMLElement)) return false;
+  const tagName = element.tagName.toLowerCase();
+  return tagName === "input" || tagName === "textarea" || element.isContentEditable;
+}
+
+function isMonacoInputElement(element) {
+  return element instanceof HTMLElement
+    && editorContainerEl.contains(element)
+    && element.classList.contains("inputarea");
 }
 
 function textToCopy() {
@@ -347,6 +360,7 @@ copyButton.addEventListener("click", () => {
 });
 
 document.addEventListener("copy", (event) => {
+  if (isEditableElement(event.target) && !isMonacoInputElement(event.target)) return;
   const text = selectedText();
   if (!text || !event.clipboardData) return;
   event.clipboardData.setData("text/plain", text);

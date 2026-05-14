@@ -124,7 +124,7 @@ async function updateCommand(rawArgs: string[]) {
     throw new Error("Usage: pi-audit update [package]");
   }
 
-  const matches = findManagedEntries().filter((entry) => matchesPackage(rawArgs[0], entry.manifest));
+  const matches = findManagedEntries().filter((entry) => matchesManagedEntry(rawArgs[0], entry));
   if (matches.length === 0) {
     throw new Error(`No managed package found for ${rawArgs[0]}`);
   }
@@ -685,6 +685,16 @@ function identityForSource(source: ParsedSource) {
     return `git:${source.host}/${source.path}`;
   }
   return `local:${resolveLocalSource(source.path, process.cwd())}`;
+}
+
+function matchesManagedEntry(inputValue: string, entry: ManagedEntry) {
+  if (matchesPackage(inputValue, entry.manifest)) {
+    return true;
+  }
+  if (inputValue === entry.source) {
+    return true;
+  }
+  return resolveLocalSource(inputValue, entry.baseDir) === resolve(entry.snapshotPath);
 }
 
 function matchesPackage(inputValue: string, manifest: Manifest) {

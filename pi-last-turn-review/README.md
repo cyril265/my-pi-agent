@@ -8,6 +8,8 @@ A tiny pi package for reviewing what just changed before you keep going.
 pi install git:https://github.com/cyril265/my-pi-agent
 ```
 
+Git installs run dependency installation from the repository root, so users do not need to run `npm install` first. Local path installs still use the checkout as-is; run `npm install` for local development.
+
 ## What it does
 
 - Opens a native diff review window for the latest agent turn with file changes.

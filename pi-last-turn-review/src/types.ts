@@ -52,6 +52,11 @@ export interface ReviewRendererErrorPayload {
   message: string;
 }
 
+export interface ReviewCopyTextPayload {
+  type: "copy-text";
+  text: string;
+}
+
 export interface ReviewRequestFilePayload {
   type: "request-file";
   requestId: string;
@@ -59,7 +64,7 @@ export interface ReviewRequestFilePayload {
   scope: ReviewScope;
 }
 
-export type ReviewWindowMessage = ReviewSubmitPayload | ReviewCancelPayload | ReviewRendererErrorPayload | ReviewRequestFilePayload;
+export type ReviewWindowMessage = ReviewSubmitPayload | ReviewCancelPayload | ReviewRendererErrorPayload | ReviewCopyTextPayload | ReviewRequestFilePayload;
 
 export interface AnnotateComment {
   id: string;

@@ -101,6 +101,61 @@ function escapeHtml(value) {
     .replace(/\"/g, "&quot;");
 }
 
+function selectedTextFromEditor(editor) {
+  if (!editor) return "";
+  const selection = editor.getSelection();
+  const model = editor.getModel();
+  if (!selection || selection.isEmpty() || !model) return "";
+  return model.getValueInRange(selection);
+}
+
+function selectedText(editor = null) {
+  if (editor) return selectedTextFromEditor(editor);
+  if (!diffEditor) return "";
+
+  const originalEditor = diffEditor.getOriginalEditor();
+  if (originalEditor.hasTextFocus?.()) return selectedTextFromEditor(originalEditor);
+
+  const modifiedEditor = diffEditor.getModifiedEditor();
+  if (modifiedEditor.hasTextFocus?.()) return selectedTextFromEditor(modifiedEditor);
+
+  return "";
+}
+
+function isEditableElement(element) {
+  if (!(element instanceof HTMLElement)) return false;
+  const tagName = element.tagName.toLowerCase();
+  return tagName === "input" || tagName === "textarea" || element.isContentEditable;
+}
+
+function isMonacoInputElement(element) {
+  return element instanceof HTMLElement
+    && editorContainerEl.contains(element)
+    && element.classList.contains("inputarea");
+}
+
+async function copyText(text) {
+  if (!text) return;
+
+  if (window.glimpse?.send) {
+    window.glimpse.send({ type: "copy-text", text });
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  }
+}
+
 function inferLanguage(path) {
   if (!path) return "plaintext";
   const lower = path.toLowerCase();
@@ -177,6 +232,11 @@ function activeComparison() {
 
 function activeFileShowsDiff() {
   return activeComparison() != null;
+}
+
+function activeFileShowsSplitDiff() {
+  const comparison = activeComparison();
+  return comparison != null && comparison.status !== "added";
 }
 
 function getScopeFilePath(file) {
@@ -512,7 +572,7 @@ function updateToggleButtons() {
 function applyEditorOptions() {
   if (!diffEditor) return;
   diffEditor.updateOptions({
-    renderSideBySide: activeFileShowsDiff(),
+    renderSideBySide: activeFileShowsSplitDiff(),
     diffWordWrap: state.wrapLines ? "on" : "off",
     hideUnchangedRegions: {
       enabled: activeFileShowsDiff() && state.hideUnchanged,
@@ -856,6 +916,18 @@ function renderAll(options = {}) {
   }
 }
 
+function createCopyKeybinding(editor) {
+  editor.onKeyDown((event) => {
+    if ((event.ctrlKey || event.metaKey) && event.code === "KeyC") {
+      const text = selectedText(editor);
+      if (!text) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void copyText(text);
+    }
+  });
+}
+
 function createGlyphHoverActions(editor, side) {
   let hoverDecoration = [];
 
@@ -990,7 +1062,7 @@ function setupMonaco() {
 
         diffEditor = monacoApi.editor.createDiffEditor(editorContainerEl, {
           automaticLayout: true,
-          renderSideBySide: activeFileShowsDiff(),
+          renderSideBySide: activeFileShowsSplitDiff(),
           readOnly: true,
           originalEditable: false,
           minimap: { enabled: true, renderCharacters: false, showSlider: "always", size: "proportional" },
@@ -1005,6 +1077,8 @@ function setupMonaco() {
           wordWrap: "on",
         });
 
+        createCopyKeybinding(diffEditor.getOriginalEditor());
+        createCopyKeybinding(diffEditor.getModifiedEditor());
         createGlyphHoverActions(diffEditor.getOriginalEditor(), "original");
         createGlyphHoverActions(diffEditor.getModifiedEditor(), "modified");
 
@@ -1072,6 +1146,14 @@ toggleWrapButton.addEventListener("click", () => {
     layoutEditor();
     setTimeout(layoutEditor, 50);
   });
+});
+
+document.addEventListener("copy", (event) => {
+  if (isEditableElement(event.target) && !isMonacoInputElement(event.target)) return;
+  const text = selectedText();
+  if (!text || !event.clipboardData) return;
+  event.clipboardData.setData("text/plain", text);
+  event.preventDefault();
 });
 
 toggleReviewedButton.addEventListener("click", () => {
