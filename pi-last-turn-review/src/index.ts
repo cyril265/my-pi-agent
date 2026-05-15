@@ -633,6 +633,101 @@ function shouldUseTopmostNativeWindow(): boolean {
   return process.platform === "win32";
 }
 
+function forceWindowsWindowToFront(title: string): void {
+  const script = String.raw`
+$signature = @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class PiWindowFocus {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+}
+"@
+Add-Type -TypeDefinition $signature -ErrorAction SilentlyContinue
+$title = $env:PI_GLIMPSE_WINDOW_TITLE
+for ($attempt = 0; $attempt -lt 20; $attempt++) {
+  $hwnd = [IntPtr]::Zero
+  $callback = [PiWindowFocus+EnumWindowsProc]{ param([IntPtr]$h, [IntPtr]$p)
+    if (-not [PiWindowFocus]::IsWindowVisible($h)) { return $true }
+    $buffer = New-Object System.Text.StringBuilder 512
+    [void][PiWindowFocus]::GetWindowText($h, $buffer, $buffer.Capacity)
+    if ($buffer.ToString() -eq $title) { $script:hwnd = $h; return $false }
+    return $true
+  }
+  [void][PiWindowFocus]::EnumWindows($callback, [IntPtr]::Zero)
+  if ($hwnd -ne [IntPtr]::Zero) {
+    $foreground = [PiWindowFocus]::GetForegroundWindow()
+    $currentThread = [PiWindowFocus]::GetCurrentThreadId()
+    $unused = 0
+    $foregroundThread = if ($foreground -eq [IntPtr]::Zero) { 0 } else { [PiWindowFocus]::GetWindowThreadProcessId($foreground, [ref]$unused) }
+    $targetThread = [PiWindowFocus]::GetWindowThreadProcessId($hwnd, [ref]$unused)
+    $attachedForeground = $false
+    $attachedTarget = $false
+    try {
+      if ($foregroundThread -ne 0 -and $foregroundThread -ne $currentThread) { $attachedForeground = [PiWindowFocus]::AttachThreadInput($currentThread, $foregroundThread, $true) }
+      if ($targetThread -ne 0 -and $targetThread -ne $currentThread) { $attachedTarget = [PiWindowFocus]::AttachThreadInput($currentThread, $targetThread, $true) }
+      [PiWindowFocus]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+      [PiWindowFocus]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+      [void][PiWindowFocus]::ShowWindowAsync($hwnd, 9)
+      [void][PiWindowFocus]::SetWindowPos($hwnd, [IntPtr]::new(-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0040)
+      [void][PiWindowFocus]::BringWindowToTop($hwnd)
+      [void][PiWindowFocus]::SetForegroundWindow($hwnd)
+    } finally {
+      if ($attachedTarget) { [void][PiWindowFocus]::AttachThreadInput($currentThread, $targetThread, $false) }
+      if ($attachedForeground) { [void][PiWindowFocus]::AttachThreadInput($currentThread, $foregroundThread, $false) }
+    }
+    if ([PiWindowFocus]::GetForegroundWindow() -eq $hwnd) { break }
+  }
+  Start-Sleep -Milliseconds 100
+}
+`;
+
+  try {
+    const child = spawn("powershell.exe", [
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-WindowStyle", "Hidden",
+      "-Command", script,
+    ], {
+      env: { ...process.env, PI_GLIMPSE_WINDOW_TITLE: title },
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+  } catch {}
+}
+
+function nudgeNativeWindowToFront(window: GlimpseWindow, title: string): void {
+  if (process.platform !== "win32") return;
+
+  const show = (): void => {
+    try {
+      window.show({ title });
+    } catch {}
+    forceWindowsWindowToFront(title);
+  };
+
+  window.once("ready", () => {
+    show();
+    for (const delay of [250, 750, 1500]) {
+      const timer = setTimeout(show, delay);
+      timer.unref?.();
+    }
+  });
+}
+
 function createReviewWindowData(
   mode: ReviewMode,
   repoRoot: string,
@@ -766,6 +861,7 @@ export default function (pi: ExtensionAPI) {
         ...(shouldUseTopmostNativeWindow() ? { floating: true } : {}),
       });
       activeWindow = window;
+      nudgeNativeWindowToFront(window, session.data.title);
 
       const waitingUI = showWaitingUI(ctx);
       const fileMap = new Map(session.data.files.map((file) => [file.id, file]));
@@ -939,6 +1035,7 @@ export default function (pi: ExtensionAPI) {
         ...(shouldUseTopmostNativeWindow() ? { floating: true } : {}),
       });
       activeWindow = window;
+      nudgeNativeWindowToFront(window, data.title);
 
       const waitingUI = showWaitingUI(ctx);
       const terminalMessagePromise = new Promise<AnnotateSubmitPayload | AnnotateCancelPayload | null>((resolve, reject) => {
