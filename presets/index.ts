@@ -1,1 +1,1 @@
-export { default } from "./presets";
+export { default } from './presets'

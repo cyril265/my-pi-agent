@@ -1,22 +1,22 @@
-declare module "proper-lockfile" {
+declare module 'proper-lockfile' {
   export interface LockOptions {
-    realpath?: boolean;
+    realpath?: boolean
     retries?:
       | number
       | {
-          retries?: number;
-          minTimeout?: number;
-          maxTimeout?: number;
-        };
+          retries?: number
+          minTimeout?: number
+          maxTimeout?: number
+        }
   }
 
-  export type ReleaseFn = () => Promise<void>;
+  export type ReleaseFn = () => Promise<void>
 
-  export function lock(path: string, options?: LockOptions): Promise<ReleaseFn>;
+  export function lock(path: string, options?: LockOptions): Promise<ReleaseFn>
 
   const lockfile: {
-    lock: typeof lock;
-  };
+    lock: typeof lock
+  }
 
-  export default lockfile;
+  export default lockfile
 }

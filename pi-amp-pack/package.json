@@ -2,7 +2,9 @@
   "name": "pi-amp-pack",
   "version": "0.1.0",
   "private": true,
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "dependencies": {
     "sq-node": "file:./sq-node"
   },
@@ -14,6 +16,8 @@
     "typebox": "*"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   }
 }
