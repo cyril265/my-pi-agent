@@ -1,0 +1,170 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.15/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.json", "**/*.jsonc"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "single",
+      "semicolons": "asNeeded",
+      "trailingCommas": "all",
+      "arrowParentheses": "asNeeded"
+    }
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+
+      "correctness": {
+        "recommended": true,
+        "noNodejsModules": "off",
+        "noUnusedImports": "error"
+      },
+      "suspicious": {
+        "recommended": true,
+        "noConsole": "off",
+        "noExplicitAny": "error",
+        "noDoubleEquals": "error",
+        "noDebugger": "error"
+      },
+      "security": "error",
+
+      "complexity": {
+        "recommended": true,
+        "noStaticOnlyClass": "error",
+        "noUselessEmptyExport": "error",
+        "noUselessThisAlias": "error",
+        "noUselessConstructor": "error",
+        "noUselessFragments": "error",
+        "useArrowFunction": "error",
+        "useFlatMap": "error",
+        "useOptionalChain": "error",
+        "useSimplifiedLogicExpression": "error",
+        "noForEach": "warn"
+      },
+
+      "style": {
+        "recommended": true,
+        "useConst": "error",
+        "noNegationElse": "error",
+        "noShoutyConstants": "error",
+        "noParameterAssign": "error",
+        "useImportType": "error",
+        "useExponentiationOperator": "error",
+        "useNumericSeparators": "error",
+        "useSelfClosingElements": "error",
+        "useTemplate": "error",
+        "useNamingConvention": "error"
+      },
+
+      "performance": {
+        "recommended": true,
+        "noBarrelFile": "warn",
+        "noReExportAll": "warn"
+      },
+
+      "nursery": {
+        "recommended": true,
+        "noFloatingPromises": "error"
+      }
+    }
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["**/dist/**"],
+      "linter": { "enabled": false },
+      "formatter": { "enabled": false }
+    },
+    {
+      "includes": [
+        "pi-amp-pack/extensions/amp-pack/subagent/agents.js",
+        "pi-amp-pack/sq-node/src/index.ts",
+        "presets/index.ts",
+        "simple-subagent/index.ts"
+      ],
+      "linter": {
+        "rules": {
+          "performance": {
+            "noBarrelFile": "info",
+            "noReExportAll": "info"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "footer/extensions/hud-footer.ts",
+        "pi-last-turn-review/src/index.ts",
+        "warp-notifications/index.ts"
+      ],
+      "linter": {
+        "rules": {
+          "suspicious": { "noControlCharactersInRegex": "off" }
+        }
+      }
+    },
+    {
+      "includes": [
+        "pi-audit/src/index.ts",
+        "pi-amp-pack/**/*.ts",
+        "simple-subagent/extensions/index.ts",
+        "warp-notifications/index.ts"
+      ],
+      "linter": {
+        "rules": {
+          "style": { "useNamingConvention": "off" }
+        }
+      }
+    },
+    {
+      "includes": ["pi-amp-pack/**/*.ts", "simple-subagent/extensions/index.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": { "noExplicitAny": "off" },
+          "security": { "noSecrets": "off" },
+          "style": { "noNonNullAssertion": "off" }
+        }
+      }
+    },
+    {
+      "includes": [
+        "pi-amp-pack/extensions/amp-pack/pi-process.ts",
+        "simple-subagent/extensions/index.ts"
+      ],
+      "linter": {
+        "rules": {
+          "nursery": { "noFloatingPromises": "off" }
+        }
+      }
+    },
+    {
+      "includes": ["pi-last-turn-review/src/index.ts", "pi-last-turn-review/types/glimpseui.d.ts"],
+      "linter": {
+        "rules": {
+          "style": { "useNamingConvention": "off" }
+        }
+      }
+    }
+  ]
+}
