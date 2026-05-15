@@ -630,7 +630,7 @@ function composeAnnotatePrompt(sourceText: string, payload: AnnotateSubmitPayloa
 }
 
 function shouldUseTopmostNativeWindow(): boolean {
-  return process.platform === "win32";
+  return false;
 }
 
 function forceWindowsWindowToFront(title: string): void {
@@ -657,7 +657,7 @@ public static class PiWindowFocus {
 "@
 Add-Type -TypeDefinition $signature -ErrorAction SilentlyContinue
 $title = $env:PI_GLIMPSE_WINDOW_TITLE
-for ($attempt = 0; $attempt -lt 20; $attempt++) {
+for ($attempt = 0; $attempt -lt 6; $attempt++) {
   $hwnd = [IntPtr]::Zero
   $callback = [PiWindowFocus+EnumWindowsProc]{ param([IntPtr]$h, [IntPtr]$p)
     if (-not [PiWindowFocus]::IsWindowVisible($h)) { return $true }
@@ -684,13 +684,14 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
       [void][PiWindowFocus]::SetWindowPos($hwnd, [IntPtr]::new(-1), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0040)
       [void][PiWindowFocus]::BringWindowToTop($hwnd)
       [void][PiWindowFocus]::SetForegroundWindow($hwnd)
+      [void][PiWindowFocus]::SetWindowPos($hwnd, [IntPtr]::new(-2), 0, 0, 0, 0, 0x0001 -bor 0x0002 -bor 0x0040)
     } finally {
       if ($attachedTarget) { [void][PiWindowFocus]::AttachThreadInput($currentThread, $targetThread, $false) }
       if ($attachedForeground) { [void][PiWindowFocus]::AttachThreadInput($currentThread, $foregroundThread, $false) }
     }
     if ([PiWindowFocus]::GetForegroundWindow() -eq $hwnd) { break }
   }
-  Start-Sleep -Milliseconds 100
+  Start-Sleep -Milliseconds 50
 }
 `;
 
@@ -712,19 +713,11 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
 function nudgeNativeWindowToFront(window: GlimpseWindow, title: string): void {
   if (process.platform !== "win32") return;
 
-  const show = (): void => {
+  window.once("ready", () => {
     try {
       window.show({ title });
     } catch {}
     forceWindowsWindowToFront(title);
-  };
-
-  window.once("ready", () => {
-    show();
-    for (const delay of [250, 750, 1500]) {
-      const timer = setTimeout(show, delay);
-      timer.unref?.();
-    }
   });
 }
 
